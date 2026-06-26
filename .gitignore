@@ -1,0 +1,31 @@
+# Build artifacts
+/target/
+
+# Local configuration and secrets
+.env
+.env.*
+!.env.example
+/config/local.toml
+/config/*.local.toml
+
+# Logs and runtime output
+*.log
+/logs/
+/tmp/
+
+# Coverage and profiling
+/coverage/
+tarpaulin-report.html
+*.profraw
+*.profdata
+
+# Editor and OS files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local planning notes
+.layout_structure
