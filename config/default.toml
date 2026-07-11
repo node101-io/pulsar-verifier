@@ -1,0 +1,3 @@
+[runtime]
+control_socket = "/tmp/pulsar-verifier/control.sock"
+shutdown_timeout_secs = 10

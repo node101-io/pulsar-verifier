@@ -1,5 +1,23 @@
 # Pulsar Verifier
 
+Yeni verifier tasarimi ve implementation referansi icin [Design Document](docs/design.md) dosyasina bakabilirsiniz.
+
+## Current CLI
+
+The current implementation provides the process lifecycle required by the upcoming P2P and RPC components. The verifier runs in the foreground:
+
+```bash
+cargo run -- run --config config/default.toml
+```
+
+A second terminal can request graceful shutdown through the configured Unix control socket:
+
+```bash
+cargo run -- stop --config config/default.toml
+```
+
+Both commands use `config/default.toml` when `--config` is omitted. `run` also handles `Ctrl-C` and `SIGTERM` through the same graceful shutdown path. The current scaffold does not yet start P2P, RPC, or proof verification services.
+
 Pulsar Verifier is a sidecar service responsible for proof propagation and verification within the Pulsar network.
 
 It operates alongside Pulsar consensus nodes and acts as the bridge between the network's proof propagation layer and the blockchain application layer. The verifier receives proofs from peers, validates them, and exposes an API that allows the Pulsar application to query proof status and verification results.
@@ -113,4 +131,4 @@ The verifier is intentionally designed as a standalone component. Future iterati
 
 ⚠️ Work in progress.
 
-The architecture, APIs, networking protocols, and verification pipeline are actively evolving and may change as the Pulsar ecosystem matures.
+The process lifecycle CLI is implemented. The P2P network, RPC services, proof storage, and verification pipeline are the next implementation stages and may change as the Pulsar ecosystem matures.
