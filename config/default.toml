@@ -1,3 +1,6 @@
 [runtime]
 control_socket = "/tmp/pulsar-verifier/control.sock"
 shutdown_timeout_secs = 10
+
+[p2p]
+enabled = false

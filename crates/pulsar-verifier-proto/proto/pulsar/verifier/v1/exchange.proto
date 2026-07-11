@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package pulsar.verifier.v1;
+
+// Requests opaque proof content by its canonical BLAKE3 hash.
+message GetProofRequest {
+  string chain_id = 1;
+  bytes proof_hash = 2;
+}
+
+// Returns either the opaque proof content or an explicit cache miss.
+message GetProofResponse {
+  string chain_id = 1;
+
+  oneof result {
+    ProofContent content = 2;
+    ProofNotFound not_found = 3;
+  }
+}
+
+// Keeps proof-system metadata out until a trustworthy type binding exists.
+message ProofContent {
+  bytes proof_hash = 1;
+  bytes proof = 2;
+}
+
+message ProofNotFound {}

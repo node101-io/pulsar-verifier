@@ -57,4 +57,16 @@ pub enum Error {
 
     #[error("failed to initialize telemetry: {0}")]
     Telemetry(String),
+
+    #[error("P2P identity error: {0}")]
+    P2pIdentity(String),
+
+    #[error("P2P authorization error: {0}")]
+    P2pAuthorization(String),
+
+    #[error("P2P protocol error: {0}")]
+    P2pProtocol(String),
+
+    #[error("P2P driver error: {0}")]
+    P2pDriver(String),
 }

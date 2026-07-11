@@ -4,6 +4,8 @@ use std::{
     time::Duration,
 };
 
+use libp2p::Multiaddr;
+use reqwest::Url;
 use serde::Deserialize;
 
 use crate::{Error, Result};
@@ -12,6 +14,7 @@ use crate::{Error, Result};
 #[derive(Debug, Clone)]
 pub struct Config {
     pub runtime: RuntimeConfig,
+    pub p2p: P2pConfig,
 }
 
 /// Process lifecycle settings shared by the `run` and `stop` commands.
@@ -21,10 +24,36 @@ pub struct RuntimeConfig {
     pub shutdown_timeout: Duration,
 }
 
+/// Validated networking settings used only when P2P is explicitly enabled.
+#[derive(Debug, Clone)]
+pub struct P2pConfig {
+    pub enabled: bool,
+    pub chain_id: String,
+    pub listen_addresses: Vec<Multiaddr>,
+    pub bootnodes: Vec<Multiaddr>,
+    pub validator_key_path: PathBuf,
+    pub comet_rpc_url: Url,
+    pub comet_rpc_timeout: Duration,
+    pub max_availability_message_bytes: usize,
+    pub max_proof_bytes: usize,
+    pub proof_request_timeout: Duration,
+    pub command_buffer: usize,
+    pub event_buffer: usize,
+}
+
+impl P2pConfig {
+    #[cfg(test)]
+    pub(crate) fn disabled() -> Self {
+        validate_p2p(FileP2pConfig::default()).expect("default P2P config must be valid")
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     runtime: FileRuntimeConfig,
+    #[serde(default)]
+    p2p: FileP2pConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -32,6 +61,42 @@ struct FileConfig {
 struct FileRuntimeConfig {
     control_socket: PathBuf,
     shutdown_timeout_secs: u64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileP2pConfig {
+    enabled: bool,
+    chain_id: String,
+    listen_addresses: Vec<String>,
+    bootnodes: Vec<String>,
+    validator_key_path: PathBuf,
+    comet_rpc_url: String,
+    comet_rpc_timeout_secs: u64,
+    max_availability_message_bytes: usize,
+    max_proof_bytes: usize,
+    proof_request_timeout_secs: u64,
+    command_buffer: usize,
+    event_buffer: usize,
+}
+
+impl Default for FileP2pConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            chain_id: String::new(),
+            listen_addresses: Vec::new(),
+            bootnodes: Vec::new(),
+            validator_key_path: PathBuf::new(),
+            comet_rpc_url: "http://127.0.0.1:26657".to_owned(),
+            comet_rpc_timeout_secs: 5,
+            max_availability_message_bytes: 64 * 1024,
+            max_proof_bytes: 8 * 1024 * 1024,
+            proof_request_timeout_secs: 10,
+            command_buffer: 64,
+            event_buffer: 256,
+        }
+    }
 }
 
 impl Config {
@@ -63,13 +128,87 @@ impl Config {
             ));
         }
 
+        let p2p = validate_p2p(file.p2p)?;
+
         Ok(Self {
             runtime: RuntimeConfig {
                 control_socket: file.runtime.control_socket,
                 shutdown_timeout: Duration::from_secs(file.runtime.shutdown_timeout_secs),
             },
+            p2p,
         })
     }
+}
+
+fn validate_p2p(file: FileP2pConfig) -> Result<P2pConfig> {
+    if file.enabled {
+        if file.chain_id.trim().is_empty() {
+            return Err(Error::InvalidConfig(
+                "p2p.chain_id must not be empty when P2P is enabled".to_owned(),
+            ));
+        }
+        if file.listen_addresses.is_empty() {
+            return Err(Error::InvalidConfig(
+                "p2p.listen_addresses must not be empty when P2P is enabled".to_owned(),
+            ));
+        }
+        if !file.validator_key_path.is_absolute() {
+            return Err(Error::InvalidConfig(
+                "p2p.validator_key_path must be absolute when P2P is enabled".to_owned(),
+            ));
+        }
+    }
+
+    let listen_addresses = parse_multiaddrs("p2p.listen_addresses", file.listen_addresses)?;
+    let bootnodes = parse_multiaddrs("p2p.bootnodes", file.bootnodes)?;
+    let comet_rpc_url = Url::parse(&file.comet_rpc_url)
+        .map_err(|error| Error::InvalidConfig(format!("p2p.comet_rpc_url is invalid: {error}")))?;
+
+    if !matches!(comet_rpc_url.scheme(), "http" | "https") {
+        return Err(Error::InvalidConfig(
+            "p2p.comet_rpc_url must use http or https".to_owned(),
+        ));
+    }
+    if file.comet_rpc_timeout_secs == 0
+        || file.proof_request_timeout_secs == 0
+        || file.max_availability_message_bytes == 0
+        || file.max_proof_bytes == 0
+        || file.command_buffer == 0
+        || file.event_buffer == 0
+    {
+        return Err(Error::InvalidConfig(
+            "P2P timeouts, message limits, and channel capacities must be greater than zero"
+                .to_owned(),
+        ));
+    }
+
+    Ok(P2pConfig {
+        enabled: file.enabled,
+        chain_id: file.chain_id,
+        listen_addresses,
+        bootnodes,
+        validator_key_path: file.validator_key_path,
+        comet_rpc_url,
+        comet_rpc_timeout: Duration::from_secs(file.comet_rpc_timeout_secs),
+        max_availability_message_bytes: file.max_availability_message_bytes,
+        max_proof_bytes: file.max_proof_bytes,
+        proof_request_timeout: Duration::from_secs(file.proof_request_timeout_secs),
+        command_buffer: file.command_buffer,
+        event_buffer: file.event_buffer,
+    })
+}
+
+fn parse_multiaddrs(field: &str, values: Vec<String>) -> Result<Vec<Multiaddr>> {
+    values
+        .into_iter()
+        .map(|value| {
+            value.parse().map_err(|error| {
+                Error::InvalidConfig(format!(
+                    "{field} contains invalid multiaddr {value}: {error}"
+                ))
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -103,6 +242,7 @@ mod tests {
             PathBuf::from("/tmp/pulsar-verifier-test.sock")
         );
         assert_eq!(config.runtime.shutdown_timeout, Duration::from_secs(7));
+        assert!(!config.p2p.enabled);
     }
 
     #[test]
@@ -159,6 +299,50 @@ mod tests {
         assert!(matches!(
             Config::from_file("/definitely/missing/pulsar-verifier.toml"),
             Err(Error::ConfigRead { .. })
+        ));
+    }
+
+    #[test]
+    fn loads_enabled_p2p_config() {
+        let file = config_file(
+            r#"
+                [runtime]
+                control_socket = "/tmp/control.sock"
+                shutdown_timeout_secs = 10
+
+                [p2p]
+                enabled = true
+                chain_id = "pulsar-test"
+                listen_addresses = ["/ip4/0.0.0.0/tcp/39000"]
+                validator_key_path = "/tmp/priv_validator_key.json"
+            "#,
+        );
+
+        let config = Config::from_file(file.path()).unwrap();
+
+        assert!(config.p2p.enabled);
+        assert_eq!(config.p2p.chain_id, "pulsar-test");
+        assert_eq!(config.p2p.max_proof_bytes, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn rejects_enabled_p2p_without_chain_id() {
+        let file = config_file(
+            r#"
+                [runtime]
+                control_socket = "/tmp/control.sock"
+                shutdown_timeout_secs = 10
+
+                [p2p]
+                enabled = true
+                listen_addresses = ["/ip4/0.0.0.0/tcp/39000"]
+                validator_key_path = "/tmp/priv_validator_key.json"
+            "#,
+        );
+
+        assert!(matches!(
+            Config::from_file(file.path()),
+            Err(Error::InvalidConfig(_))
         ));
     }
 }

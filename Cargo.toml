@@ -1,5 +1,5 @@
 [workspace]
-members = ["."]
+members = [".", "crates/pulsar-verifier-proto"]
 resolver = "2"
 
 [package]
@@ -11,15 +11,26 @@ description = "Pulsar validator proof verification sidecar"
 license = "Apache-2.0"
 
 [dependencies]
+async-trait = "0.1"
+base64 = "0.22"
+blake3 = "1.8"
 clap = { version = "4.5", features = ["derive"] }
+futures = "0.3"
+libp2p = { version = "0.56", features = ["dns", "ed25519", "gossipsub", "identify", "macros", "noise", "ping", "quic", "request-response", "tcp", "tokio", "yamux"] }
 nix = { version = "0.30", default-features = false, features = ["process", "signal", "user"] }
+prost = "0.13"
+pulsar-verifier-proto = { path = "crates/pulsar-verifier-proto" }
+rand = "0.9"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
 thiserror = "2.0"
 tokio = { version = "1.47", features = ["fs", "io-util", "macros", "net", "rt-multi-thread", "signal", "sync", "time"] }
 tokio-util = { version = "0.7", features = ["rt"] }
 toml = "0.9"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+zeroize = "1.8"
 
 [dev-dependencies]
 tempfile = "3.20"

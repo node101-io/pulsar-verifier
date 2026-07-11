@@ -1,0 +1,21 @@
+[package]
+name = "pulsar-verifier-proto"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Wire contracts for Pulsar verifier nodes"
+license = "Apache-2.0"
+
+[dependencies]
+prost = "0.13"
+
+[build-dependencies]
+prost-build = "0.13"
+protoc-bin-vendored = "3.1"
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+all = "deny"
+pedantic = "deny"

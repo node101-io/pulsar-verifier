@@ -1,5 +1,6 @@
 pub mod cli;
 pub mod config;
+pub mod p2p;
 
 mod app;
 mod control;

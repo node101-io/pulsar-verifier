@@ -14,7 +14,21 @@ A second terminal can request graceful shutdown through the configured Unix cont
 cargo run -- stop --config config/default.toml
 ```
 
-Both commands use `config/default.toml` when `--config` is omitted. `run` also handles `Ctrl-C` and `SIGTERM` through the same graceful shutdown path. The current scaffold does not yet start P2P, RPC, or proof verification services.
+Both commands use `config/default.toml` when `--config` is omitted. `run` also handles `Ctrl-C` and `SIGTERM` through the same graceful shutdown path. P2P starts when explicitly enabled; RPC and proof verification services are not implemented yet.
+
+## Validator P2P
+
+P2P is disabled in `config/default.toml` so the process lifecycle can run without validator credentials. Copy `config/local.toml.example`, provide an absolute `priv_validator_key.json` path and the local CometBFT RPC URL, then set `p2p.enabled = true` to start the validator network.
+
+The current P2P layer provides:
+
+* QUIC v1 with TCP, Noise, and Yamux fallback
+* Validator-set authorization bootstrapped once from CometBFT RPC
+* Signed GossipSub availability announcements and provider queries
+* Direct request-response transfer for opaque proof bytes
+* Runtime authorization replacement ready for a future Pulsar Listener event
+
+P2P startup is fail-closed: the verifier checks the configured chain ID, requires a fully synced CometBFT node, and verifies that its consensus-derived PeerId belongs to the active validator set. Proof-system routing and cryptographic verification are intentionally not connected yet.
 
 Pulsar Verifier is a sidecar service responsible for proof propagation and verification within the Pulsar network.
 
@@ -129,4 +143,4 @@ The verifier is intentionally designed as a standalone component. Future iterati
 
 ⚠️ Work in progress.
 
-The process lifecycle CLI is implemented. The P2P network, RPC services, proof storage, and verification pipeline are the next implementation stages and may change as the Pulsar ecosystem matures.
+The process lifecycle CLI and validator-authorized P2P transport are implemented. RPC services, proof storage, Pulsar Listener, and the verification pipeline are the next implementation stages and may change as the Pulsar ecosystem matures.

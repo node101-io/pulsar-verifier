@@ -1,3 +1,20 @@
 [runtime]
 control_socket = "/tmp/pulsar-verifier-local/control.sock"
 shutdown_timeout_secs = 10
+
+[p2p]
+enabled = true
+chain_id = "pulsar-local-1"
+listen_addresses = [
+  "/ip4/0.0.0.0/udp/39000/quic-v1",
+  "/ip4/0.0.0.0/tcp/39000",
+]
+bootnodes = []
+validator_key_path = "/home/pulsar/.pulsar/config/priv_validator_key.json"
+comet_rpc_url = "http://127.0.0.1:26657"
+comet_rpc_timeout_secs = 5
+max_availability_message_bytes = 65536
+max_proof_bytes = 8388608
+proof_request_timeout_secs = 10
+command_buffer = 64
+event_buffer = 256
