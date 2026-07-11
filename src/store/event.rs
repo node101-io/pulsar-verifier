@@ -57,4 +57,10 @@ impl ProofStoreSubscription {
     ) -> std::result::Result<ProofStoreEvent, broadcast::error::RecvError> {
         self.receiver.recv().await
     }
+
+    pub(crate) fn try_recv(
+        &mut self,
+    ) -> std::result::Result<ProofStoreEvent, broadcast::error::TryRecvError> {
+        self.receiver.try_recv()
+    }
 }

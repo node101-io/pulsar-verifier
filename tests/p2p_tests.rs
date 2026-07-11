@@ -358,6 +358,182 @@ async fn forgetting_local_proof_removes_it_from_provider_queries() {
 }
 
 #[tokio::test]
+async fn driver_requires_drain_and_rejects_new_work_afterward() {
+    let identity = identity::Keypair::generate_ed25519();
+    let peer_id = identity.public().to_peer_id();
+    let node = TestNode::start(
+        identity,
+        HashSet::from([peer_id]),
+        "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+    )
+    .await;
+
+    assert!(matches!(
+        node.handle.shutdown().await,
+        Err(pulsar_verifier::Error::P2pNotDrained)
+    ));
+    node.handle.drain().await.unwrap();
+    assert!(matches!(
+        node.handle
+            .dial(
+                PeerId::random(),
+                vec!["/ip4/127.0.0.1/tcp/9".parse().unwrap()],
+            )
+            .await,
+        Err(pulsar_verifier::Error::P2pDraining)
+    ));
+    assert!(matches!(
+        node.handle
+            .query_availability(ProofHash::digest(b"proof"))
+            .await,
+        Err(pulsar_verifier::Error::P2pDraining)
+    ));
+    node.handle.shutdown().await.unwrap();
+    timeout(EVENT_TIMEOUT, node.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+}
+
+#[tokio::test]
+async fn drain_waits_for_an_accepted_inbound_proof_response() {
+    let (mut server, client) = connected_nodes("/ip4/127.0.0.1/tcp/0").await;
+    let proof = b"accepted-before-drain".to_vec();
+    let proof_hash = ProofHash::digest(&proof);
+
+    client
+        .handle
+        .request_proof(server.peer_id, proof_hash)
+        .await
+        .unwrap();
+    let request_id = loop {
+        if let P2pEvent::ProofRequested {
+            request_id,
+            proof_hash: requested,
+            ..
+        } = next_event(&mut server.events).await
+        {
+            assert_eq!(requested, proof_hash);
+            break request_id;
+        }
+    };
+
+    let drain_handle = server.handle.clone();
+    let mut drain = tokio::spawn(async move { drain_handle.drain().await });
+    assert!(
+        timeout(Duration::from_millis(100), &mut drain)
+            .await
+            .is_err()
+    );
+    server
+        .handle
+        .respond_proof(
+            request_id,
+            Some(ProofContent {
+                proof_hash,
+                proof: proof.into(),
+            }),
+        )
+        .await
+        .unwrap();
+    timeout(EVENT_TIMEOUT, drain)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    server.handle.shutdown().await.unwrap();
+    timeout(EVENT_TIMEOUT, server.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    client.stop().await;
+}
+
+#[tokio::test]
+async fn drain_waits_for_an_accepted_outbound_proof_response() {
+    let (mut server, mut client) = connected_nodes("/ip4/127.0.0.1/tcp/0").await;
+    let proof_hash = ProofHash::digest(b"outbound-before-drain");
+
+    client
+        .handle
+        .request_proof(server.peer_id, proof_hash)
+        .await
+        .unwrap();
+    let request_id = loop {
+        if let P2pEvent::ProofRequested { request_id, .. } = next_event(&mut server.events).await {
+            break request_id;
+        }
+    };
+    let drain_handle = client.handle.clone();
+    let mut drain = tokio::spawn(async move { drain_handle.drain().await });
+    assert!(
+        timeout(Duration::from_millis(100), &mut drain)
+            .await
+            .is_err()
+    );
+
+    server.handle.respond_proof(request_id, None).await.unwrap();
+    loop {
+        if matches!(
+            next_event(&mut client.events).await,
+            P2pEvent::ProofNotFound { proof_hash: missing, .. } if missing == proof_hash
+        ) {
+            break;
+        }
+    }
+    timeout(EVENT_TIMEOUT, drain)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+
+    client.handle.shutdown().await.unwrap();
+    timeout(EVENT_TIMEOUT, client.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn inbound_request_after_drain_returns_not_found_without_application_event() {
+    let (mut server, mut client) = connected_nodes("/ip4/127.0.0.1/tcp/0").await;
+    let proof_hash = ProofHash::digest(b"requested-after-drain");
+    server.handle.drain().await.unwrap();
+
+    client
+        .handle
+        .request_proof(server.peer_id, proof_hash)
+        .await
+        .unwrap();
+    loop {
+        if matches!(
+            next_event(&mut client.events).await,
+            P2pEvent::ProofNotFound { proof_hash: missing, .. } if missing == proof_hash
+        ) {
+            break;
+        }
+    }
+    assert!(
+        timeout(Duration::from_millis(100), server.events.recv())
+            .await
+            .is_err()
+    );
+
+    server.handle.shutdown().await.unwrap();
+    timeout(EVENT_TIMEOUT, server.task)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    client.stop().await;
+}
+
+#[tokio::test]
 async fn unauthorized_inbound_peer_never_reaches_protocol_events() {
     let first_identity = identity::Keypair::generate_ed25519();
     let second_identity = identity::Keypair::generate_ed25519();

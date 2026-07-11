@@ -159,15 +159,31 @@ impl P2pHandle {
             .await
     }
 
+    /// Stops accepting new network work and waits for accepted exchanges to finish.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the driver is closed or already draining.
+    pub async fn drain(&self) -> Result<()> {
+        self.call(|reply| Command::Drain { reply }).await
+    }
+
+    /// Stops a driver after its accepted work has drained.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the driver is closed or has not drained.
+    pub async fn shutdown(&self) -> Result<()> {
+        self.call(|reply| Command::Shutdown { reply }).await
+    }
+
     async fn call<T>(&self, command: impl FnOnce(CommandReply<T>) -> Command) -> Result<T> {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(command(reply))
             .await
-            .map_err(|_| Error::P2pDriver("driver command channel is closed".to_owned()))?;
-        response
-            .await
-            .map_err(|_| Error::P2pDriver("driver dropped command response".to_owned()))?
+            .map_err(|_| Error::P2pDriverClosed)?;
+        response.await.map_err(|_| Error::P2pDriverClosed)?
     }
 }
 
@@ -211,6 +227,18 @@ enum Command {
         peers: HashSet<PeerId>,
         reply: CommandReply<()>,
     },
+    Drain {
+        reply: CommandReply<()>,
+    },
+    Shutdown {
+        reply: CommandReply<()>,
+    },
+}
+
+enum DriverState {
+    Running,
+    Draining { reply: CommandReply<()> },
+    Drained,
 }
 
 struct OutboundProofRequest {
@@ -243,7 +271,9 @@ pub struct P2pDriver {
     events: mpsc::Sender<P2pEvent>,
     delayed_responses: FuturesUnordered<futures::future::BoxFuture<'static, Vec<u8>>>,
     pending_listeners: HashSet<libp2p::core::transport::ListenerId>,
+    listeners: HashSet<libp2p::core::transport::ListenerId>,
     ready: Option<oneshot::Sender<Result<()>>>,
+    state: DriverState,
 }
 
 impl P2pDriver {
@@ -277,11 +307,13 @@ impl P2pDriver {
             .build();
 
         let mut pending_listeners = HashSet::new();
+        let mut listeners = HashSet::new();
         for address in &config.listen_addresses {
             let id = swarm.listen_on(address.clone()).map_err(|error| {
                 Error::P2pDriver(format!("failed to listen on {address}: {error}"))
             })?;
             pending_listeners.insert(id);
+            listeners.insert(id);
         }
 
         let mut bootnodes = HashMap::<PeerId, Vec<Multiaddr>>::new();
@@ -325,7 +357,9 @@ impl P2pDriver {
                 events,
                 delayed_responses: FuturesUnordered::new(),
                 pending_listeners,
+                listeners,
                 ready: Some(ready_tx),
+                state: DriverState::Running,
             },
             P2pHandle {
                 commands: command_tx,
@@ -335,7 +369,7 @@ impl P2pDriver {
         ))
     }
 
-    /// Runs until cancellation or an unrecoverable command/network failure.
+    /// Runs until ordered shutdown, force cancellation, or an unrecoverable failure.
     ///
     /// # Errors
     ///
@@ -343,27 +377,35 @@ impl P2pDriver {
     pub async fn run(mut self, cancellation: CancellationToken) -> Result<()> {
         let mut cleanup = tokio::time::interval(Duration::from_secs(1));
         loop {
-            tokio::select! {
-                biased;
+            let should_stop = tokio::select! {
                 () = cancellation.cancelled() => return Ok(()),
                 command = self.commands.recv() => {
-                    let command = command.ok_or_else(|| {
-                        Error::P2pDriver("driver command channel closed".to_owned())
-                    })?;
-                    self.handle_command(command);
+                    let command = command.ok_or(Error::P2pDriverClosed)?;
+                    self.handle_command(command)
                 }
-                event = self.swarm.select_next_some() => self.handle_swarm_event(event).await?,
+                event = self.swarm.select_next_some() => {
+                    self.handle_swarm_event(event).await?;
+                    false
+                },
                 Some(response) = self.delayed_responses.next(), if !self.delayed_responses.is_empty() => {
                     if let Err(error) = self.swarm.behaviour_mut().gossipsub.publish(self.topic.clone(), response) {
                         tracing::debug!(%error, "availability response was not published");
                     }
+                    false
                 }
-                _ = cleanup.tick() => self.expire_queries(),
+                _ = cleanup.tick() => {
+                    self.expire_queries();
+                    false
+                },
+            };
+            self.finish_drain();
+            if should_stop {
+                return Ok(());
             }
         }
     }
 
-    fn handle_command(&mut self, command: Command) {
+    fn handle_command(&mut self, command: Command) -> bool {
         match command {
             Command::Dial {
                 peer,
@@ -411,13 +453,37 @@ impl P2pDriver {
                 let _ = reply.send(self.respond_proof(request_id, content));
             }
             Command::ReplaceAuthorizedPeers { peers, reply } => {
-                self.replace_authorized_peers(peers);
-                let _ = reply.send(Ok(()));
+                if self.is_running() {
+                    self.replace_authorized_peers(peers);
+                    let _ = reply.send(Ok(()));
+                } else {
+                    let _ = reply.send(Err(Error::P2pDraining));
+                }
+            }
+            Command::Drain { reply } => match self.state {
+                DriverState::Running => {
+                    self.begin_drain(reply);
+                }
+                DriverState::Draining { .. } => {
+                    let _ = reply.send(Err(Error::P2pDraining));
+                }
+                DriverState::Drained => {
+                    let _ = reply.send(Ok(()));
+                }
+            },
+            Command::Shutdown { reply } => {
+                if matches!(self.state, DriverState::Drained) {
+                    let _ = reply.send(Ok(()));
+                    return true;
+                }
+                let _ = reply.send(Err(Error::P2pNotDrained));
             }
         }
+        false
     }
 
     fn dial(&mut self, peer: PeerId, addresses: Vec<Multiaddr>) -> Result<()> {
+        self.require_running()?;
         if !self.authorized_peers.contains(&peer) {
             return Err(Error::P2pAuthorization(format!(
                 "refusing to dial unauthorized peer {peer}"
@@ -438,6 +504,9 @@ impl P2pDriver {
 
     fn announce(&mut self, proof_hash: ProofHash) -> Result<()> {
         self.availability.add(proof_hash, self.local_peer_id);
+        if !self.is_running() {
+            return Ok(());
+        }
         let bytes = availability::announcement(&self.config.chain_id, proof_hash);
         self.swarm
             .behaviour_mut()
@@ -454,6 +523,7 @@ impl P2pDriver {
     }
 
     fn query_availability(&mut self, proof_hash: ProofHash) -> Result<QueryId> {
+        self.require_running()?;
         let query_id = QueryId::random();
         let bytes = availability::query(&self.config.chain_id, query_id, proof_hash);
         self.swarm
@@ -467,6 +537,7 @@ impl P2pDriver {
     }
 
     fn request_proof(&mut self, peer: PeerId, proof_hash: ProofHash) -> Result<ProofRequestId> {
+        self.require_running()?;
         if !self.authorized_peers.contains(&peer) {
             return Err(Error::P2pAuthorization(format!(
                 "refusing proof request to unauthorized peer {peer}"
@@ -574,14 +645,63 @@ impl P2pDriver {
         // TODO: Pulsar Listener should fetch and submit a new complete set only on change events.
     }
 
+    fn begin_drain(&mut self, reply: CommandReply<()>) {
+        tracing::info!(
+            inbound = self.inbound_requests.len(),
+            outbound = self.outbound_requests.len(),
+            delayed = self.delayed_responses.len(),
+            "p2p drain started"
+        );
+        for listener in self.listeners.drain() {
+            self.pending_listeners.remove(&listener);
+            let _ = self.swarm.remove_listener(listener);
+        }
+        self.outstanding_queries.clear();
+        self.state = DriverState::Draining { reply };
+    }
+
+    fn finish_drain(&mut self) {
+        if !matches!(self.state, DriverState::Draining { .. })
+            || !self.inbound_requests.is_empty()
+            || !self.outbound_requests.is_empty()
+            || !self.in_flight.is_empty()
+            || !self.delayed_responses.is_empty()
+        {
+            return;
+        }
+
+        let DriverState::Draining { reply } =
+            std::mem::replace(&mut self.state, DriverState::Drained)
+        else {
+            unreachable!("drain state checked above");
+        };
+        tracing::info!("p2p driver drained");
+        let _ = reply.send(Ok(()));
+    }
+
+    fn is_running(&self) -> bool {
+        matches!(self.state, DriverState::Running)
+    }
+
+    fn require_running(&self) -> Result<()> {
+        if self.is_running() {
+            Ok(())
+        } else {
+            Err(Error::P2pDraining)
+        }
+    }
+
     async fn handle_swarm_event(&mut self, event: SwarmEvent<PulsarBehaviourEvent>) -> Result<()> {
         match event {
             SwarmEvent::NewListenAddr {
                 listener_id,
                 address,
             } => {
+                self.listeners.insert(listener_id);
                 self.pending_listeners.remove(&listener_id);
-                self.emit(P2pEvent::Listening { address }).await;
+                if self.is_running() {
+                    self.emit(P2pEvent::Listening { address }).await;
+                }
                 if self.pending_listeners.is_empty() {
                     if let Some(ready) = self.ready.take() {
                         let _ = ready.send(Ok(()));
@@ -589,16 +709,21 @@ impl P2pDriver {
                 }
             }
             SwarmEvent::ListenerError { listener_id, error } => {
+                self.listeners.remove(&listener_id);
                 self.pending_listeners.remove(&listener_id);
                 if let Some(ready) = self.ready.take() {
                     let _ = ready.send(Err(Error::P2pDriver(format!(
                         "listener failed during startup: {error}"
                     ))));
                 }
-                return Err(Error::P2pDriver(format!("listener failed: {error}")));
+                if self.is_running() {
+                    return Err(Error::P2pDriver(format!("listener failed: {error}")));
+                }
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                self.emit(P2pEvent::PeerConnected { peer: peer_id }).await;
+                if self.is_running() {
+                    self.emit(P2pEvent::PeerConnected { peer: peer_id }).await;
+                }
             }
             SwarmEvent::ConnectionClosed {
                 peer_id,
@@ -606,8 +731,10 @@ impl P2pDriver {
                 ..
             } => {
                 self.availability.remove_peer(peer_id);
-                self.emit(P2pEvent::PeerDisconnected { peer: peer_id })
-                    .await;
+                if self.is_running() {
+                    self.emit(P2pEvent::PeerDisconnected { peer: peer_id })
+                        .await;
+                }
             }
             SwarmEvent::Behaviour(PulsarBehaviourEvent::Gossipsub(event)) => {
                 self.handle_gossip(event).await;
@@ -667,6 +794,9 @@ impl P2pDriver {
         let Ok((source, payload)) = validated else {
             return;
         };
+        if !self.is_running() {
+            return;
+        }
         match payload {
             ValidatedAvailability::Announcement { proof_hash } => {
                 self.availability.add(proof_hash, source);
@@ -769,6 +899,14 @@ impl P2pDriver {
         request: GetProofRequest,
         channel: ResponseChannel<GetProofResponse>,
     ) {
+        if !self.is_running() {
+            let _ = self
+                .swarm
+                .behaviour_mut()
+                .proof_exchange
+                .send_response(channel, not_found_response(&self.config.chain_id));
+            return;
+        }
         let proof_hash =
             if self.authorized_peers.contains(&peer) && request.chain_id == self.config.chain_id {
                 ProofHash::try_from(request.proof_hash.as_slice()).ok()

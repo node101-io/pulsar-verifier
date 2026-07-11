@@ -72,6 +72,21 @@ pub enum Error {
     #[error("P2P driver error: {0}")]
     P2pDriver(String),
 
+    #[error("P2P driver is draining")]
+    P2pDraining,
+
+    #[error("P2P driver must be drained before shutdown")]
+    P2pNotDrained,
+
+    #[error("P2P event loop is closed")]
+    P2pEventLoopClosed,
+
+    #[error("P2P driver is closed")]
+    P2pDriverClosed,
+
+    #[error("{0} task exited unexpectedly")]
+    TaskExitedUnexpectedly(&'static str),
+
     #[error("invalid proof hash: {0}")]
     InvalidProofHash(String),
 

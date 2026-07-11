@@ -1,14 +1,13 @@
-use std::{collections::HashSet, sync::Arc};
+use std::sync::Arc;
 
-use tokio::{signal, sync::mpsc, task::JoinSet, time::timeout};
-use tokio_util::sync::CancellationToken;
+use tokio::signal;
 
 use crate::{
     Error, Result,
-    config::{Config, P2pConfig},
+    config::Config,
     control::ControlServer,
-    p2p::{P2pDriver, P2pEvent, P2pHandle, ValidatorSetClient, load_validator_identity},
-    store::{ProofStore, ProofStoreEvent, ProofStoreSubscription},
+    p2p::{P2pRuntime, TaskExit},
+    store::ProofStore,
 };
 
 /// Owns the verifier process lifecycle and future long-running components.
@@ -17,13 +16,12 @@ pub(crate) struct App;
 impl App {
     pub(crate) async fn run(config: Config) -> Result<()> {
         let control = ControlServer::bind(&config.runtime.control_socket).await?;
-        let cancellation = CancellationToken::new();
-        let mut tasks = JoinSet::new();
         let proof_store = Arc::new(ProofStore::new(config.proof_store)?);
-
-        if config.p2p.enabled {
-            start_p2p(&config.p2p, proof_store, &cancellation, &mut tasks).await?;
-        }
+        let mut p2p = if config.p2p.enabled {
+            Some(P2pRuntime::start(&config.p2p, proof_store).await?)
+        } else {
+            None
+        };
 
         // TODO: Start the RPC server with a child cancellation token.
 
@@ -32,191 +30,55 @@ impl App {
             "pulsar verifier started"
         );
 
-        let runtime_result = tokio::select! {
+        let exit = tokio::select! {
             result = control.wait_for_shutdown() => {
                 tracing::info!("shutdown requested through control socket");
-                result
+                AppExit::Requested(result)
             }
             result = wait_for_signal() => {
                 tracing::info!("shutdown requested by process signal");
-                result
+                AppExit::Requested(result)
             }
-            task = tasks.join_next(), if !tasks.is_empty() => {
-                match task {
-                    Some(Ok(Ok(()))) => Err(Error::P2pDriver(
-                        "long-running runtime task exited unexpectedly".to_owned(),
-                    )),
-                    Some(Ok(Err(error))) => Err(error),
-                    Some(Err(error)) => Err(Error::Task(error)),
-                    None => Err(Error::P2pDriver("runtime task set became empty".to_owned())),
-                }
+            task = wait_for_p2p_exit(&mut p2p) => {
+                AppExit::P2pTask(task)
             }
         };
 
-        // Every future component observes the same token before its task is joined.
-        cancellation.cancel();
-        let drain_result = drain_tasks(&mut tasks, config.runtime.shutdown_timeout).await;
+        let runtime_result = match exit {
+            AppExit::Requested(request_result) => {
+                let shutdown_result = match p2p.as_mut() {
+                    Some(runtime) => runtime.shutdown(config.runtime.shutdown_timeout).await,
+                    None => Ok(()),
+                };
+                request_result?;
+                shutdown_result
+            }
+            AppExit::P2pTask(task) => {
+                let error = task.into_error();
+                if let Some(runtime) = p2p.as_mut() {
+                    runtime.force_shutdown().await;
+                }
+                Err(error)
+            }
+        };
         drop(control);
 
         runtime_result?;
-        drain_result?;
         tracing::info!("pulsar verifier stopped");
         Ok(())
     }
 }
 
-async fn start_p2p(
-    config: &P2pConfig,
-    proof_store: Arc<ProofStore>,
-    cancellation: &CancellationToken,
-    tasks: &mut JoinSet<Result<()>>,
-) -> Result<()> {
-    let identity = load_validator_identity(&config.validator_key_path)?;
-    let local_peer_id = identity.public().to_peer_id();
-    let validator_client = ValidatorSetClient::new(
-        config.comet_rpc_url.clone(),
-        config.chain_id.clone(),
-        config.comet_rpc_timeout,
-    )?;
-    let authorized_peers = validator_client.load().await?;
-    if !authorized_peers.contains(&local_peer_id) {
-        return Err(Error::P2pAuthorization(format!(
-            "local peer {local_peer_id} is not in the active validator set"
-        )));
-    }
-
-    let (driver, handle, events, ready) =
-        P2pDriver::new(config.clone(), identity, authorized_peers)?;
-    let store_events = proof_store.subscribe();
-    tasks.spawn(driver.run(cancellation.child_token()));
-    tasks.spawn(run_p2p_events(
-        handle,
-        events,
-        proof_store,
-        store_events,
-        cancellation.child_token(),
-    ));
-
-    ready
-        .await
-        .map_err(|_| Error::P2pDriver("driver exited before becoming ready".to_owned()))??;
-
-    // TODO: Pulsar Listener should call ValidatorSetClient::load and replace_authorized_peers
-    // only after observing an on-chain validator-set change event.
-    tracing::info!(%local_peer_id, "validator-authorized P2P network is ready");
-    Ok(())
+enum AppExit {
+    Requested(Result<()>),
+    P2pTask(TaskExit),
 }
 
-async fn run_p2p_events(
-    handle: P2pHandle,
-    mut events: mpsc::Receiver<P2pEvent>,
-    proof_store: Arc<ProofStore>,
-    mut store_events: ProofStoreSubscription,
-    cancellation: CancellationToken,
-) -> Result<()> {
-    reconcile_local_proofs(&handle, &proof_store).await?;
-    loop {
-        tokio::select! {
-            biased;
-            () = cancellation.cancelled() => return Ok(()),
-            event = events.recv() => {
-                let event = event.ok_or_else(|| {
-                    Error::P2pDriver("P2P event channel closed".to_owned())
-                })?;
-                match event {
-                    P2pEvent::ProofRequested { request_id, proof_hash, .. } => {
-                        let content = proof_store.get_content(proof_hash).await;
-                        tolerate_shutdown(
-                            handle.respond_proof(request_id, content).await,
-                            &cancellation,
-                        )?;
-                    }
-                    P2pEvent::ProofReceived { peer, content, .. } => {
-                        if let Err(error) = proof_store
-                            .attach_downloaded_proof(content.proof_hash, content.proof, peer)
-                            .await
-                        {
-                            match error {
-                                Error::ProofNotObserved(_)
-                                | Error::ProofHashMismatch(_)
-                                | Error::ProofTooLarge { .. } => {
-                                    tracing::debug!(%error, %peer, "downloaded proof was not stored");
-                                }
-                                error => return Err(error),
-                            }
-                        }
-                    }
-                    P2pEvent::PeerConnected { .. } => {
-                        tolerate_shutdown(
-                            reconcile_local_proofs(&handle, &proof_store).await,
-                            &cancellation,
-                        )?;
-                    }
-                    event => tracing::debug!(?event, "P2P event"),
-                }
-            }
-            event = store_events.recv() => {
-                match event {
-                    Ok(ProofStoreEvent::ProofStored { proof_hash, .. }) => {
-                        tolerate_shutdown(handle.announce(proof_hash).await, &cancellation)?;
-                    }
-                    Ok(ProofStoreEvent::ProofEvicted { proof_hash, .. }) => {
-                        tolerate_shutdown(
-                            handle.forget_local_proof(proof_hash).await,
-                            &cancellation,
-                        )?;
-                    }
-                    Ok(event) => tracing::debug!(?event, "proof store event"),
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                        tracing::warn!(skipped, "proof store subscriber lagged; reconciling local proofs");
-                        tolerate_shutdown(
-                            reconcile_local_proofs(&handle, &proof_store).await,
-                            &cancellation,
-                        )?;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        return Err(Error::ProofStore("proof store event channel closed".to_owned()));
-                    }
-                }
-            }
-        }
+async fn wait_for_p2p_exit(runtime: &mut Option<P2pRuntime>) -> TaskExit {
+    match runtime {
+        Some(runtime) => runtime.wait_for_exit().await,
+        None => std::future::pending().await,
     }
-}
-
-fn tolerate_shutdown(result: Result<()>, cancellation: &CancellationToken) -> Result<()> {
-    match result {
-        Err(_) if cancellation.is_cancelled() => Ok(()),
-        result => result,
-    }
-}
-
-async fn reconcile_local_proofs(handle: &P2pHandle, store: &ProofStore) -> Result<()> {
-    let proofs = store.locally_available_proofs();
-    let hashes = proofs
-        .iter()
-        .map(|proof| proof.hash)
-        .collect::<HashSet<_>>();
-    handle.replace_local_proofs(hashes).await?;
-    for proof in proofs {
-        handle.announce(proof.hash).await?;
-    }
-    Ok(())
-}
-
-async fn drain_tasks(
-    tasks: &mut JoinSet<Result<()>>,
-    shutdown_timeout: std::time::Duration,
-) -> Result<()> {
-    let drain = async {
-        while let Some(result) = tasks.join_next().await {
-            result??;
-        }
-        Ok(())
-    };
-
-    timeout(shutdown_timeout, drain)
-        .await
-        .map_err(|_| Error::ShutdownTimeout(shutdown_timeout))?
 }
 
 async fn wait_for_signal() -> Result<()> {
@@ -237,11 +99,14 @@ mod tests {
     use libp2p::{Multiaddr, identity};
     use reqwest::Url;
     use tempfile::TempDir;
+    use tokio::time::timeout;
+    use tokio_util::sync::CancellationToken;
 
     use super::*;
     use crate::{
         config::{P2pConfig, ProofStoreConfig, RuntimeConfig},
         control::request_shutdown,
+        p2p::{P2pDriver, P2pEventLoop, P2pEventLoopHandle, P2pHandle},
         proof::{ProofHash, ProofType},
         store::ProofSource,
     };
@@ -273,7 +138,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn p2p_bridge_serves_and_stores_chain_observed_proof() {
+    async fn p2p_event_loop_serves_and_stores_chain_observed_proof() {
         let server_identity = identity::Keypair::generate_ed25519();
         let client_identity = identity::Keypair::generate_ed25519();
         let server_peer = server_identity.public().to_peer_id();
@@ -313,32 +178,26 @@ mod tests {
         )
         .unwrap();
         let cancellation = CancellationToken::new();
-        let server_driver_task = tokio::spawn(server_driver.run(cancellation.child_token()));
-        let server_bridge_task = tokio::spawn(run_p2p_events(
-            server_handle,
+        let (server_event_loop, server_event_loop_handle) = P2pEventLoop::new(
+            server_handle.clone(),
             server_events,
             Arc::clone(&server_store),
-            server_store.subscribe(),
-            cancellation.child_token(),
-        ));
-        let client_driver_task = tokio::spawn(client_driver.run(cancellation.child_token()));
-        let client_bridge_task = tokio::spawn(run_p2p_events(
+            32,
+        );
+        let (client_event_loop, client_event_loop_handle) = P2pEventLoop::new(
             client_handle.clone(),
             client_events,
             Arc::clone(&client_store),
-            client_store.subscribe(),
-            cancellation.child_token(),
-        ));
-        timeout(Duration::from_secs(5), server_ready)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
-        timeout(Duration::from_secs(5), client_ready)
-            .await
-            .unwrap()
-            .unwrap()
-            .unwrap();
+            32,
+        );
+        let server_driver_task = tokio::spawn(server_driver.run(cancellation.child_token()));
+        let server_event_loop_task =
+            tokio::spawn(server_event_loop.run(cancellation.child_token()));
+        let client_driver_task = tokio::spawn(client_driver.run(cancellation.child_token()));
+        let client_event_loop_task =
+            tokio::spawn(client_event_loop.run(cancellation.child_token()));
+        wait_ready(server_ready).await;
+        wait_ready(client_ready).await;
 
         client_handle
             .dial(server_peer, vec![server_address])
@@ -365,19 +224,49 @@ mod tests {
         .await
         .unwrap();
 
-        cancellation.cancel();
-        for task in [
+        shutdown_test_p2p(
+            server_handle,
+            server_event_loop_handle,
             server_driver_task,
-            server_bridge_task,
+            server_event_loop_task,
+        )
+        .await;
+        shutdown_test_p2p(
+            client_handle,
+            client_event_loop_handle,
             client_driver_task,
-            client_bridge_task,
-        ] {
-            timeout(Duration::from_secs(5), task)
-                .await
-                .unwrap()
-                .unwrap()
-                .unwrap();
-        }
+            client_event_loop_task,
+        )
+        .await;
+    }
+
+    async fn shutdown_test_p2p(
+        handle: P2pHandle,
+        event_loop: P2pEventLoopHandle,
+        driver_task: tokio::task::JoinHandle<Result<()>>,
+        event_loop_task: tokio::task::JoinHandle<Result<()>>,
+    ) {
+        handle.drain().await.unwrap();
+        event_loop.shutdown().await.unwrap();
+        timeout(Duration::from_secs(5), event_loop_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        handle.shutdown().await.unwrap();
+        timeout(Duration::from_secs(5), driver_task)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    async fn wait_ready(ready: tokio::sync::oneshot::Receiver<Result<()>>) {
+        timeout(Duration::from_secs(5), ready)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
     }
 
     fn free_tcp_address() -> Multiaddr {
