@@ -1,7 +1,5 @@
 # Pulsar Verifier
 
-Yeni verifier tasarimi ve implementation referansi icin [Design Document](docs/design.md) dosyasina bakabilirsiniz.
-
 ## Current CLI
 
 The current implementation provides the process lifecycle required by the upcoming P2P and RPC components. The verifier runs in the foreground:
