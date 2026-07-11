@@ -2,5 +2,11 @@
 control_socket = "/tmp/pulsar-verifier/control.sock"
 shutdown_timeout_secs = 10
 
+[proof_store]
+max_capacity_bytes = 536870912
+max_proof_bytes = 8388608
+terminal_retention_secs = 900
+event_buffer = 256
+
 [p2p]
 enabled = false

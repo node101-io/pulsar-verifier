@@ -179,7 +179,7 @@ async fn tcp_propagates_availability_and_transfers_opaque_proof() {
             inbound_id,
             Some(ProofContent {
                 proof_hash,
-                proof: proof.clone(),
+                proof: proof.clone().into(),
             }),
         )
         .await
@@ -338,6 +338,23 @@ async fn unauthorized_outbound_dial_is_rejected_before_transport() {
     assert!(result.is_err());
 
     node.stop().await;
+}
+
+#[tokio::test]
+async fn forgetting_local_proof_removes_it_from_provider_queries() {
+    let (first, second) = connected_nodes("/ip4/127.0.0.1/tcp/0").await;
+    let proof_hash = ProofHash::digest(b"evicted-proof");
+
+    first.handle.announce(proof_hash).await.unwrap();
+    assert_eq!(
+        first.handle.providers(proof_hash).await.unwrap(),
+        vec![first.peer_id]
+    );
+    first.handle.forget_local_proof(proof_hash).await.unwrap();
+    assert!(first.handle.providers(proof_hash).await.unwrap().is_empty());
+
+    first.stop().await;
+    second.stop().await;
 }
 
 #[tokio::test]

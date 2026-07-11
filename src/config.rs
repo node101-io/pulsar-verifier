@@ -14,6 +14,7 @@ use crate::{Error, Result};
 #[derive(Debug, Clone)]
 pub struct Config {
     pub runtime: RuntimeConfig,
+    pub proof_store: ProofStoreConfig,
     pub p2p: P2pConfig,
 }
 
@@ -22,6 +23,15 @@ pub struct Config {
 pub struct RuntimeConfig {
     pub control_socket: PathBuf,
     pub shutdown_timeout: Duration,
+}
+
+/// Memory and lifecycle limits for the process-local proof cache.
+#[derive(Debug, Clone, Copy)]
+pub struct ProofStoreConfig {
+    pub max_capacity_bytes: u64,
+    pub max_proof_bytes: usize,
+    pub terminal_retention: Duration,
+    pub event_buffer: usize,
 }
 
 /// Validated networking settings used only when P2P is explicitly enabled.
@@ -44,7 +54,16 @@ pub struct P2pConfig {
 impl P2pConfig {
     #[cfg(test)]
     pub(crate) fn disabled() -> Self {
-        validate_p2p(FileP2pConfig::default()).expect("default P2P config must be valid")
+        validate_p2p(FileP2pConfig::default(), 8 * 1024 * 1024)
+            .expect("default P2P config must be valid")
+    }
+}
+
+impl ProofStoreConfig {
+    #[cfg(test)]
+    pub(crate) fn test_default() -> Self {
+        validate_proof_store(FileProofStoreConfig::default())
+            .expect("default proof store config must be valid")
     }
 }
 
@@ -53,7 +72,29 @@ impl P2pConfig {
 struct FileConfig {
     runtime: FileRuntimeConfig,
     #[serde(default)]
+    proof_store: FileProofStoreConfig,
+    #[serde(default)]
     p2p: FileP2pConfig,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(default, deny_unknown_fields)]
+struct FileProofStoreConfig {
+    max_capacity_bytes: u64,
+    max_proof_bytes: usize,
+    terminal_retention_secs: u64,
+    event_buffer: usize,
+}
+
+impl Default for FileProofStoreConfig {
+    fn default() -> Self {
+        Self {
+            max_capacity_bytes: 512 * 1024 * 1024,
+            max_proof_bytes: 8 * 1024 * 1024,
+            terminal_retention_secs: 15 * 60,
+            event_buffer: 256,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -74,7 +115,6 @@ struct FileP2pConfig {
     comet_rpc_url: String,
     comet_rpc_timeout_secs: u64,
     max_availability_message_bytes: usize,
-    max_proof_bytes: usize,
     proof_request_timeout_secs: u64,
     command_buffer: usize,
     event_buffer: usize,
@@ -91,7 +131,6 @@ impl Default for FileP2pConfig {
             comet_rpc_url: "http://127.0.0.1:26657".to_owned(),
             comet_rpc_timeout_secs: 5,
             max_availability_message_bytes: 64 * 1024,
-            max_proof_bytes: 8 * 1024 * 1024,
             proof_request_timeout_secs: 10,
             command_buffer: 64,
             event_buffer: 256,
@@ -128,19 +167,46 @@ impl Config {
             ));
         }
 
-        let p2p = validate_p2p(file.p2p)?;
+        let proof_store = validate_proof_store(file.proof_store)?;
+        let p2p = validate_p2p(file.p2p, proof_store.max_proof_bytes)?;
 
         Ok(Self {
             runtime: RuntimeConfig {
                 control_socket: file.runtime.control_socket,
                 shutdown_timeout: Duration::from_secs(file.runtime.shutdown_timeout_secs),
             },
+            proof_store,
             p2p,
         })
     }
 }
 
-fn validate_p2p(file: FileP2pConfig) -> Result<P2pConfig> {
+fn validate_proof_store(file: FileProofStoreConfig) -> Result<ProofStoreConfig> {
+    if file.max_capacity_bytes == 0
+        || file.max_proof_bytes == 0
+        || file.terminal_retention_secs == 0
+        || file.event_buffer == 0
+    {
+        return Err(Error::InvalidConfig(
+            "proof store capacity, proof limit, retention, and event buffer must be greater than zero"
+                .to_owned(),
+        ));
+    }
+    if u64::try_from(file.max_proof_bytes).unwrap_or(u64::MAX) > file.max_capacity_bytes {
+        return Err(Error::InvalidConfig(
+            "proof_store.max_proof_bytes must not exceed max_capacity_bytes".to_owned(),
+        ));
+    }
+
+    Ok(ProofStoreConfig {
+        max_capacity_bytes: file.max_capacity_bytes,
+        max_proof_bytes: file.max_proof_bytes,
+        terminal_retention: Duration::from_secs(file.terminal_retention_secs),
+        event_buffer: file.event_buffer,
+    })
+}
+
+fn validate_p2p(file: FileP2pConfig, max_proof_bytes: usize) -> Result<P2pConfig> {
     if file.enabled {
         if file.chain_id.trim().is_empty() {
             return Err(Error::InvalidConfig(
@@ -172,7 +238,6 @@ fn validate_p2p(file: FileP2pConfig) -> Result<P2pConfig> {
     if file.comet_rpc_timeout_secs == 0
         || file.proof_request_timeout_secs == 0
         || file.max_availability_message_bytes == 0
-        || file.max_proof_bytes == 0
         || file.command_buffer == 0
         || file.event_buffer == 0
     {
@@ -191,7 +256,7 @@ fn validate_p2p(file: FileP2pConfig) -> Result<P2pConfig> {
         comet_rpc_url,
         comet_rpc_timeout: Duration::from_secs(file.comet_rpc_timeout_secs),
         max_availability_message_bytes: file.max_availability_message_bytes,
-        max_proof_bytes: file.max_proof_bytes,
+        max_proof_bytes,
         proof_request_timeout: Duration::from_secs(file.proof_request_timeout_secs),
         command_buffer: file.command_buffer,
         event_buffer: file.event_buffer,
@@ -242,6 +307,12 @@ mod tests {
             PathBuf::from("/tmp/pulsar-verifier-test.sock")
         );
         assert_eq!(config.runtime.shutdown_timeout, Duration::from_secs(7));
+        assert_eq!(config.proof_store.max_capacity_bytes, 512 * 1024 * 1024);
+        assert_eq!(config.proof_store.max_proof_bytes, 8 * 1024 * 1024);
+        assert_eq!(
+            config.proof_store.terminal_retention,
+            Duration::from_secs(900)
+        );
         assert!(!config.p2p.enabled);
     }
 
@@ -337,6 +408,26 @@ mod tests {
                 enabled = true
                 listen_addresses = ["/ip4/0.0.0.0/tcp/39000"]
                 validator_key_path = "/tmp/priv_validator_key.json"
+            "#,
+        );
+
+        assert!(matches!(
+            Config::from_file(file.path()),
+            Err(Error::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_proof_store_limits() {
+        let file = config_file(
+            r#"
+                [runtime]
+                control_socket = "/tmp/control.sock"
+                shutdown_timeout_secs = 10
+
+                [proof_store]
+                max_capacity_bytes = 1024
+                max_proof_bytes = 2048
             "#,
         );
 

@@ -70,6 +70,29 @@ impl P2pHandle {
             .await
     }
 
+    /// Removes local ownership after proof content leaves the process cache.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the driver task is unavailable.
+    pub async fn forget_local_proof(&self, proof_hash: ProofHash) -> Result<()> {
+        self.call(|reply| Command::ForgetLocalProof { proof_hash, reply })
+            .await
+    }
+
+    /// Reconciles local ownership after a lagged store event subscription.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the driver task is unavailable.
+    pub async fn replace_local_proofs(&self, proof_hashes: HashSet<ProofHash>) -> Result<()> {
+        self.call(|reply| Command::ReplaceLocalProofs {
+            proof_hashes,
+            reply,
+        })
+        .await
+    }
+
     /// Broadcasts a provider lookup for one proof hash.
     ///
     /// # Errors
@@ -156,6 +179,14 @@ enum Command {
     },
     Announce {
         proof_hash: ProofHash,
+        reply: CommandReply<()>,
+    },
+    ForgetLocalProof {
+        proof_hash: ProofHash,
+        reply: CommandReply<()>,
+    },
+    ReplaceLocalProofs {
+        proof_hashes: HashSet<ProofHash>,
         reply: CommandReply<()>,
     },
     QueryAvailability {
@@ -313,6 +344,7 @@ impl P2pDriver {
         let mut cleanup = tokio::time::interval(Duration::from_secs(1));
         loop {
             tokio::select! {
+                biased;
                 () = cancellation.cancelled() => return Ok(()),
                 command = self.commands.recv() => {
                     let command = command.ok_or_else(|| {
@@ -342,6 +374,21 @@ impl P2pDriver {
             }
             Command::Announce { proof_hash, reply } => {
                 let _ = reply.send(self.announce(proof_hash));
+            }
+            Command::ForgetLocalProof { proof_hash, reply } => {
+                self.availability
+                    .remove_provider(proof_hash, self.local_peer_id);
+                // TODO: Add availability leases and periodic re-announcement so remote
+                // peers eventually discard ownership that could not be withdrawn.
+                let _ = reply.send(Ok(()));
+            }
+            Command::ReplaceLocalProofs {
+                proof_hashes,
+                reply,
+            } => {
+                self.availability
+                    .replace_provider_proofs(self.local_peer_id, &proof_hashes);
+                let _ = reply.send(Ok(()));
             }
             Command::QueryAvailability { proof_hash, reply } => {
                 let _ = reply.send(self.query_availability(proof_hash));
@@ -397,7 +444,13 @@ impl P2pDriver {
             .gossipsub
             .publish(self.topic.clone(), bytes)
             .map(|_| ())
-            .map_err(|error| Error::P2pDriver(format!("failed to publish announcement: {error}")))
+            .or_else(|error| match error {
+                gossipsub::PublishError::NoPeersSubscribedToTopic
+                | gossipsub::PublishError::Duplicate => Ok(()),
+                error => Err(Error::P2pDriver(format!(
+                    "failed to publish announcement: {error}"
+                ))),
+            })
     }
 
     fn query_availability(&mut self, proof_hash: ProofHash) -> Result<QueryId> {
@@ -469,7 +522,7 @@ impl P2pDriver {
                 }
                 get_proof_response::Result::Content(pulsar_verifier_proto::v1::ProofContent {
                     proof_hash: content.proof_hash.as_bytes().to_vec(),
-                    proof: content.proof,
+                    proof: content.proof.to_vec(),
                 })
             }
             None => get_proof_response::Result::NotFound(ProofNotFound {}),
@@ -861,7 +914,7 @@ fn validate_proof_content(
     }
     Ok(ProofContent {
         proof_hash: response_hash,
-        proof: content.proof,
+        proof: content.proof.into(),
     })
 }
 

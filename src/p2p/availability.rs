@@ -64,6 +64,17 @@ impl AvailabilityIndex {
             !providers.is_empty()
         });
     }
+
+    pub(crate) fn replace_provider_proofs(
+        &mut self,
+        peer: PeerId,
+        proof_hashes: &HashSet<ProofHash>,
+    ) {
+        self.remove_peer(peer);
+        for proof_hash in proof_hashes {
+            self.add(*proof_hash, peer);
+        }
+    }
 }
 
 pub(crate) fn decode_and_validate(

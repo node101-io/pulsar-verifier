@@ -14,9 +14,11 @@ license = "Apache-2.0"
 async-trait = "0.1"
 base64 = "0.22"
 blake3 = "1.8"
+bytes = "1.10"
 clap = { version = "4.5", features = ["derive"] }
 futures = "0.3"
 libp2p = { version = "0.56", features = ["dns", "ed25519", "gossipsub", "identify", "macros", "noise", "ping", "quic", "request-response", "tcp", "tokio", "yamux"] }
+moka = { version = "0.12", features = ["future"] }
 nix = { version = "0.30", default-features = false, features = ["process", "signal", "user"] }
 prost = "0.13"
 pulsar-verifier-proto = { path = "crates/pulsar-verifier-proto" }

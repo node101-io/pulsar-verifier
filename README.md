@@ -14,7 +14,7 @@ A second terminal can request graceful shutdown through the configured Unix cont
 cargo run -- stop --config config/default.toml
 ```
 
-Both commands use `config/default.toml` when `--config` is omitted. `run` also handles `Ctrl-C` and `SIGTERM` through the same graceful shutdown path. P2P starts when explicitly enabled; RPC and proof verification services are not implemented yet.
+Both commands use `config/default.toml` when `--config` is omitted. `run` also handles `Ctrl-C` and `SIGTERM` through the same graceful shutdown path. P2P starts when explicitly enabled; RPC and cryptographic verification services are not implemented yet.
 
 ## Validator P2P
 
@@ -29,6 +29,12 @@ The current P2P layer provides:
 * Runtime authorization replacement ready for a future Pulsar Listener event
 
 P2P startup is fail-closed: the verifier checks the configured chain ID, requires a fully synced CometBFT node, and verifies that its consensus-derived PeerId belongs to the active validator set. Proof-system routing and cryptographic verification are intentionally not connected yet.
+
+## Ephemeral Proof Store
+
+Proof lifecycle state is held in a process-local Moka cache keyed by the canonical BLAKE3 proof hash. One immutable record combines chain-owned metadata with optional proof bytes, allowing either the chain observation or the proof content to arrive first. Store transitions publish bounded events used by P2P to announce newly available content and answer inbound proof requests.
+
+The development defaults allow 512 MiB of weighted proof records and proofs up to 8 MiB. `Verified` and `Wrong` records expire 15 minutes after verification completes. Capacity eviction can remove non-terminal records to preserve the process memory limit. The store is intentionally non-persistent; restarting the verifier discards proof content and lifecycle state.
 
 Pulsar Verifier is a sidecar service responsible for proof propagation and verification within the Pulsar network.
 
@@ -134,7 +140,6 @@ The verifier is intentionally designed as a standalone component. Future iterati
 
 * Additional proof systems
 * Alternative propagation strategies
-* Persistent proof storage
 * Proof indexing and querying capabilities
 * Advanced peer discovery mechanisms
 * Metrics and observability tooling
@@ -143,4 +148,4 @@ The verifier is intentionally designed as a standalone component. Future iterati
 
 ⚠️ Work in progress.
 
-The process lifecycle CLI and validator-authorized P2P transport are implemented. RPC services, proof storage, Pulsar Listener, and the verification pipeline are the next implementation stages and may change as the Pulsar ecosystem matures.
+The process lifecycle CLI, validator-authorized P2P transport, and event-driven ephemeral ProofStore are implemented. RPC services, Pulsar Listener, proof retrieval policy, and the cryptographic verification pipeline are the next implementation stages and may change as the Pulsar ecosystem matures.

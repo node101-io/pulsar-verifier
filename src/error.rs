@@ -2,6 +2,8 @@ use std::{io, path::PathBuf, time::Duration};
 
 use thiserror::Error;
 
+use crate::proof::{ProofHash, ProofType};
+
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
 /// Errors are typed so the CLI can provide actionable lifecycle failures.
@@ -69,4 +71,39 @@ pub enum Error {
 
     #[error("P2P driver error: {0}")]
     P2pDriver(String),
+
+    #[error("invalid proof hash: {0}")]
+    InvalidProofHash(String),
+
+    #[error("invalid proof type: {0}")]
+    InvalidProofType(String),
+
+    #[error("proof store error: {0}")]
+    ProofStore(String),
+
+    #[error("proof {proof_hash:?} is {actual_bytes} bytes; maximum is {max_bytes}")]
+    ProofTooLarge {
+        proof_hash: ProofHash,
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
+
+    #[error("proof bytes do not match expected hash {0:?}")]
+    ProofHashMismatch(ProofHash),
+
+    #[error("proof {proof_hash:?} type conflict: existing {existing}, incoming {incoming}")]
+    ProofTypeConflict {
+        proof_hash: ProofHash,
+        existing: ProofType,
+        incoming: ProofType,
+    },
+
+    #[error("proof {0:?} has not been observed on-chain")]
+    ProofNotObserved(ProofHash),
+
+    #[error("invalid verification transition for proof {proof_hash:?}: {reason}")]
+    InvalidVerificationTransition {
+        proof_hash: ProofHash,
+        reason: String,
+    },
 }
