@@ -6,7 +6,7 @@ use reqwest::Url;
 use tokio::{sync::mpsc, task::JoinHandle, time::timeout};
 use tokio_util::sync::CancellationToken;
 
-use super::{Driver, DriverClient, DriverEvent, DriverParts, Worker, WorkerHandle};
+use super::{Driver, DriverClient, DriverEvent, DriverParts, Worker};
 use crate::{
     Result,
     config::{P2pConfig, ProofStoreConfig},
@@ -20,7 +20,6 @@ struct TestNode {
     peer_id: PeerId,
     client: DriverClient,
     events: mpsc::Receiver<DriverEvent>,
-    cancellation: CancellationToken,
     task: JoinHandle<Result<()>>,
     listen_address: Multiaddr,
 }
@@ -39,8 +38,7 @@ impl TestNode {
             mut events,
             ready,
         } = Driver::build(config, identity, authorized).unwrap();
-        let cancellation = CancellationToken::new();
-        let task = tokio::spawn(driver.run(cancellation.clone()));
+        let task = tokio::spawn(driver.run());
         timeout(EVENT_TIMEOUT, ready)
             .await
             .unwrap()
@@ -56,7 +54,6 @@ impl TestNode {
             peer_id,
             client,
             events,
-            cancellation,
             task,
             listen_address,
         }
@@ -74,7 +71,8 @@ impl TestNode {
     }
 
     async fn stop(self) {
-        self.cancellation.cancel();
+        self.client.drain().await.unwrap();
+        drop(self.client);
         timeout(EVENT_TIMEOUT, self.task)
             .await
             .unwrap()
@@ -367,7 +365,7 @@ async fn forgetting_local_proof_removes_it_from_provider_queries() {
 }
 
 #[tokio::test]
-async fn driver_requires_drain_and_rejects_new_work_afterward() {
+async fn driver_rejects_new_work_after_drain_and_exits_when_mailbox_closes() {
     let identity = identity::Keypair::generate_ed25519();
     let peer_id = identity.public().to_peer_id();
     let node = TestNode::start(
@@ -377,10 +375,6 @@ async fn driver_requires_drain_and_rejects_new_work_afterward() {
     )
     .await;
 
-    assert!(matches!(
-        node.client.shutdown().await,
-        Err(crate::Error::P2pNotDrained)
-    ));
     node.client.drain().await.unwrap();
     assert!(matches!(
         node.client
@@ -397,12 +391,28 @@ async fn driver_requires_drain_and_rejects_new_work_afterward() {
             .await,
         Err(crate::Error::P2pDraining)
     ));
-    node.client.shutdown().await.unwrap();
+    drop(node.client);
     timeout(EVENT_TIMEOUT, node.task)
         .await
         .unwrap()
         .unwrap()
         .unwrap();
+}
+
+#[tokio::test]
+async fn driver_treats_mailbox_closure_before_drain_as_fatal() {
+    let identity = identity::Keypair::generate_ed25519();
+    let peer_id = identity.public().to_peer_id();
+    let node = TestNode::start(
+        identity,
+        HashSet::from([peer_id]),
+        "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+    )
+    .await;
+
+    drop(node.client);
+    let result = timeout(EVENT_TIMEOUT, node.task).await.unwrap().unwrap();
+    assert!(matches!(result, Err(crate::Error::P2pDriverClosed)));
 }
 
 #[tokio::test]
@@ -452,7 +462,7 @@ async fn drain_waits_for_an_accepted_inbound_proof_response() {
         .unwrap()
         .unwrap();
 
-    server.client.shutdown().await.unwrap();
+    drop(server.client);
     timeout(EVENT_TIMEOUT, server.task)
         .await
         .unwrap()
@@ -500,7 +510,7 @@ async fn drain_waits_for_an_accepted_outbound_proof_response() {
         .unwrap()
         .unwrap();
 
-    client.client.shutdown().await.unwrap();
+    drop(client.client);
     timeout(EVENT_TIMEOUT, client.task)
         .await
         .unwrap()
@@ -534,7 +544,7 @@ async fn inbound_request_after_drain_returns_not_found_without_application_event
             .is_err()
     );
 
-    server.client.shutdown().await.unwrap();
+    drop(server.client);
     timeout(EVENT_TIMEOUT, server.task)
         .await
         .unwrap()
@@ -588,7 +598,7 @@ async fn unauthorized_inbound_peer_never_reaches_protocol_events() {
 struct StoreBackedNode {
     peer_id: PeerId,
     client: DriverClient,
-    worker: WorkerHandle,
+    worker_stop: CancellationToken,
     driver_task: JoinHandle<Result<()>>,
     worker_task: JoinHandle<Result<()>>,
 }
@@ -608,11 +618,10 @@ impl StoreBackedNode {
             events,
             ready,
         } = Driver::build(config.clone(), identity, authorized).unwrap();
-        let (worker, worker_handle) =
-            Worker::new(client.clone(), events, store, config.event_buffer);
-        let cancellation = CancellationToken::new();
-        let driver_task = tokio::spawn(driver.run(cancellation.child_token()));
-        let worker_task = tokio::spawn(worker.run(cancellation.child_token()));
+        let worker = Worker::new(client.clone(), events, store);
+        let worker_stop = CancellationToken::new();
+        let driver_task = tokio::spawn(driver.run());
+        let worker_task = tokio::spawn(worker.run(worker_stop.clone()));
         timeout(EVENT_TIMEOUT, ready)
             .await
             .unwrap()
@@ -622,7 +631,7 @@ impl StoreBackedNode {
         Self {
             peer_id,
             client,
-            worker: worker_handle,
+            worker_stop,
             driver_task,
             worker_task,
         }
@@ -630,13 +639,13 @@ impl StoreBackedNode {
 
     async fn stop(self) {
         self.client.drain().await.unwrap();
-        self.worker.shutdown().await.unwrap();
+        self.worker_stop.cancel();
         timeout(EVENT_TIMEOUT, self.worker_task)
             .await
             .unwrap()
             .unwrap()
             .unwrap();
-        self.client.shutdown().await.unwrap();
+        drop(self.client);
         timeout(EVENT_TIMEOUT, self.driver_task)
             .await
             .unwrap()

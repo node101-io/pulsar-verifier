@@ -17,7 +17,6 @@ use pulsar_verifier_proto::v1::{
     GetProofRequest, GetProofResponse, ProofNotFound, get_proof_response,
 };
 use tokio::sync::{mpsc, oneshot};
-use tokio_util::sync::CancellationToken;
 
 use crate::{
     Error, Result,
@@ -179,15 +178,6 @@ impl DriverClient {
         self.call(|reply| DriverCommand::Drain { reply }).await
     }
 
-    /// Stops a driver after its accepted work has drained.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the driver is closed or has not drained.
-    pub(super) async fn shutdown(&self) -> Result<()> {
-        self.call(|reply| DriverCommand::Shutdown { reply }).await
-    }
-
     async fn call<T>(&self, command: impl FnOnce(CommandReply<T>) -> DriverCommand) -> Result<T> {
         let (reply, response) = oneshot::channel();
         self.commands
@@ -240,9 +230,6 @@ enum DriverCommand {
         reply: CommandReply<()>,
     },
     Drain {
-        reply: CommandReply<()>,
-    },
-    Shutdown {
         reply: CommandReply<()>,
     },
 }
@@ -381,19 +368,21 @@ impl Driver {
         })
     }
 
-    /// Runs until ordered shutdown, force cancellation, or an unrecoverable failure.
+    /// Runs until drained ownership closes the mailbox or an unrecoverable failure occurs.
     ///
     /// # Errors
     ///
     /// Returns an error when the command channel closes unexpectedly or a fatal event occurs.
-    pub(super) async fn run(mut self, cancellation: CancellationToken) -> Result<()> {
+    pub(super) async fn run(mut self) -> Result<()> {
         let mut cleanup = tokio::time::interval(Duration::from_secs(1));
         loop {
             let should_stop = tokio::select! {
-                () = cancellation.cancelled() => return Ok(()),
                 command = self.commands.recv() => {
-                    let command = command.ok_or(Error::P2pDriverClosed)?;
-                    self.handle_command(command)
+                    match command {
+                        Some(command) => self.handle_command(command),
+                        None if matches!(self.state, DriverState::Drained) => true,
+                        None => return Err(Error::P2pDriverClosed),
+                    }
                 }
                 event = self.swarm.select_next_some() => {
                     self.handle_swarm_event(event).await?;
@@ -483,13 +472,6 @@ impl Driver {
                     let _ = reply.send(Ok(()));
                 }
             },
-            DriverCommand::Shutdown { reply } => {
-                if matches!(self.state, DriverState::Drained) {
-                    let _ = reply.send(Ok(()));
-                    return true;
-                }
-                let _ = reply.send(Err(Error::P2pNotDrained));
-            }
         }
         false
     }

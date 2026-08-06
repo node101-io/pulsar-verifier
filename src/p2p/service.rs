@@ -6,8 +6,7 @@ use tokio_util::sync::CancellationToken;
 use crate::{Error, Result, config::P2pConfig, store::ProofStore};
 
 use super::{
-    Driver, DriverClient, DriverParts, ValidatorSetClient, Worker, WorkerHandle,
-    load_validator_identity,
+    Driver, DriverClient, DriverParts, ValidatorSetClient, Worker, load_validator_identity,
 };
 
 const DRIVER_TASK: &str = "p2p driver";
@@ -31,11 +30,10 @@ impl P2pExit {
 
 /// Owns P2P task dependencies and their ordered graceful-shutdown protocol.
 pub(crate) struct P2pService {
-    driver: DriverClient,
-    worker: WorkerHandle,
+    driver: Option<DriverClient>,
+    worker_stop: CancellationToken,
     driver_task: Option<JoinHandle<Result<()>>>,
     worker_task: Option<JoinHandle<Result<()>>>,
-    force_cancel: CancellationToken,
 }
 
 impl P2pService {
@@ -60,17 +58,15 @@ impl P2pService {
             events,
             ready,
         } = Driver::build(config.clone(), identity, authorized_peers)?;
-        let (worker, worker_handle) =
-            Worker::new(client.clone(), events, store, config.event_buffer);
-        let force_cancel = CancellationToken::new();
-        let driver_task = tokio::spawn(driver.run(force_cancel.child_token()));
-        let worker_task = tokio::spawn(worker.run(force_cancel.child_token()));
-        let mut service = Self {
-            driver: client,
-            worker: worker_handle,
+        let worker = Worker::new(client.clone(), events, store);
+        let worker_stop = CancellationToken::new();
+        let driver_task = tokio::spawn(driver.run());
+        let worker_task = tokio::spawn(worker.run(worker_stop.clone()));
+        let service = Self {
+            driver: Some(client),
+            worker_stop,
             driver_task: Some(driver_task),
             worker_task: Some(worker_task),
-            force_cancel,
         };
 
         let Ok(readiness) = ready.await else {
@@ -111,16 +107,16 @@ impl P2pService {
         }
     }
 
-    pub(crate) async fn shutdown(&mut self, shutdown_timeout: Duration) -> Result<()> {
+    pub(crate) async fn shutdown(mut self, shutdown_timeout: Duration) -> Result<()> {
         match timeout(shutdown_timeout, self.shutdown_ordered()).await {
             Ok(Ok(())) => Ok(()),
             Ok(Err(error)) => {
-                self.force_shutdown().await;
+                self.abort_and_join().await;
                 Err(error)
             }
             Err(_) => {
                 self.log_pending_phase();
-                self.force_shutdown().await;
+                self.abort_and_join().await;
                 Err(Error::ShutdownTimeout(shutdown_timeout))
             }
         }
@@ -128,23 +124,51 @@ impl P2pService {
 
     async fn shutdown_ordered(&mut self) -> Result<()> {
         // TODO: Stop future RPC, Listener, and verifier producers before P2P drain.
-        let driver = self.driver.clone();
-        tokio::select! {
-            result = driver.drain() => result?,
-            exit = self.wait_for_exit() => return Err(exit.into_error()),
+        {
+            let driver = self.driver.as_ref().ok_or(Error::P2pDriverClosed)?.clone();
+            tokio::select! {
+                result = driver.drain() => result?,
+                exit = self.wait_for_exit() => return Err(exit.into_error()),
+            }
         }
-        self.worker.shutdown().await?;
-        join_task(&mut self.worker_task, WORKER_TASK).await?;
-        self.driver.shutdown().await?;
+
+        self.worker_stop.cancel();
+        self.wait_for_worker_shutdown().await?;
+        drop(self.driver.take());
         join_task(&mut self.driver_task, DRIVER_TASK).await?;
         tracing::info!("p2p shutdown complete");
         Ok(())
     }
 
-    pub(crate) async fn force_shutdown(&mut self) {
-        self.force_cancel.cancel();
+    pub(crate) async fn force_shutdown(mut self) {
+        self.abort_and_join().await;
+    }
+
+    async fn abort_and_join(&mut self) {
         abort_task(&mut self.worker_task).await;
         abort_task(&mut self.driver_task).await;
+    }
+
+    async fn wait_for_worker_shutdown(&mut self) -> Result<()> {
+        let driver = self
+            .driver_task
+            .as_mut()
+            .ok_or(Error::TaskExitedUnexpectedly(DRIVER_TASK))?;
+        let worker = self
+            .worker_task
+            .as_mut()
+            .ok_or(Error::TaskExitedUnexpectedly(WORKER_TASK))?;
+
+        tokio::select! {
+            result = worker => {
+                self.worker_task.take();
+                task_result(result)
+            }
+            result = driver => {
+                self.driver_task.take();
+                Err(P2pExit { task: DRIVER_TASK, result }.into_error())
+            }
+        }
     }
 
     fn log_pending_phase(&self) {
@@ -156,9 +180,34 @@ impl P2pService {
     }
 }
 
+impl Drop for P2pService {
+    fn drop(&mut self) {
+        let active = self.driver_task.is_some() || self.worker_task.is_some();
+        if active {
+            tracing::warn!("P2P service dropped before task shutdown completed");
+        }
+        if let Some(task) = &self.worker_task {
+            task.abort();
+        }
+        if let Some(task) = &self.driver_task {
+            task.abort();
+        }
+    }
+}
+
 async fn join_task(task: &mut Option<JoinHandle<Result<()>>>, name: &'static str) -> Result<()> {
-    let task = task.take().ok_or(Error::TaskExitedUnexpectedly(name))?;
-    match task.await {
+    // Keep the handle owned by the service while awaiting so timeout cancellation
+    // cannot detach the underlying task before force shutdown can abort it.
+    let result = task
+        .as_mut()
+        .ok_or(Error::TaskExitedUnexpectedly(name))?
+        .await;
+    task.take();
+    task_result(result)
+}
+
+fn task_result(result: std::result::Result<Result<()>, tokio::task::JoinError>) -> Result<()> {
+    match result {
         Ok(result) => result,
         Err(error) => Err(Error::Task(error)),
     }
@@ -178,7 +227,15 @@ async fn abort_task(task: &mut Option<JoinHandle<Result<()>>>) {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashSet, future::pending, path::PathBuf};
+    use std::{
+        collections::HashSet,
+        future::pending,
+        path::PathBuf,
+        sync::{
+            Arc,
+            atomic::{AtomicBool, Ordering},
+        },
+    };
 
     use libp2p::{Multiaddr, identity};
     use reqwest::Url;
@@ -189,23 +246,81 @@ mod tests {
     #[tokio::test]
     async fn ordered_shutdown_is_repeatable() {
         for _ in 0..10 {
-            let mut service = test_service(false).await;
+            let (service, worker_dropped) = test_service(false).await;
             service.shutdown(Duration::from_secs(2)).await.unwrap();
+            assert!(worker_dropped.load(Ordering::SeqCst));
         }
     }
 
     #[tokio::test]
     async fn shutdown_timeout_force_stops_remaining_tasks() {
-        let mut service = test_service(true).await;
+        let (service, worker_dropped) = test_service(true).await;
         assert!(matches!(
             service.shutdown(Duration::from_millis(50)).await,
             Err(Error::ShutdownTimeout(_))
         ));
-        assert!(service.driver_task.is_none());
-        assert!(service.worker_task.is_none());
+        assert!(worker_dropped.load(Ordering::SeqCst));
     }
 
-    async fn test_service(stall_worker: bool) -> P2pService {
+    #[tokio::test]
+    async fn dropping_service_aborts_owned_tasks() {
+        let (service, worker_dropped) = test_service(true).await;
+        drop(service);
+
+        timeout(Duration::from_secs(1), async {
+            while !worker_dropped.load(Ordering::SeqCst) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn unexpected_driver_exit_is_reported_and_sibling_is_stopped() {
+        let (mut service, worker_dropped) = test_service(true).await;
+        service.driver_task.as_ref().unwrap().abort();
+
+        let exit = service.wait_for_exit().await;
+        assert_eq!(exit.task, DRIVER_TASK);
+        assert!(matches!(exit.into_error(), Error::Task(_)));
+        service.force_shutdown().await;
+        assert!(worker_dropped.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn unexpected_worker_exit_is_reported_and_driver_is_stopped() {
+        let (mut service, _) = test_service(true).await;
+        service.worker_task.as_ref().unwrap().abort();
+
+        let exit = service.wait_for_exit().await;
+        assert_eq!(exit.task, WORKER_TASK);
+        assert!(matches!(exit.into_error(), Error::Task(_)));
+        service.force_shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn driver_failure_during_worker_drain_remains_the_root_error() {
+        let (mut service, worker_dropped) = test_service(true).await;
+        service.driver.as_ref().unwrap().drain().await.unwrap();
+        service.worker_stop.cancel();
+        service.driver_task.as_ref().unwrap().abort();
+
+        let error = service.wait_for_worker_shutdown().await.unwrap_err();
+        assert!(matches!(error, Error::Task(_)));
+        service.force_shutdown().await;
+        assert!(worker_dropped.load(Ordering::SeqCst));
+    }
+
+    struct DropFlag(Arc<AtomicBool>);
+
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    async fn test_service(stall_worker: bool) -> (P2pService, Arc<AtomicBool>) {
         let identity = identity::Keypair::generate_ed25519();
         let local_peer = identity.public().to_peer_id();
         let config = test_config();
@@ -216,28 +331,36 @@ mod tests {
             events,
             ready,
         } = Driver::build(config.clone(), identity, HashSet::from([local_peer])).unwrap();
-        let (worker, worker_handle) =
-            Worker::new(client.clone(), events, store, config.event_buffer);
-        let force_cancel = CancellationToken::new();
-        let driver_task = tokio::spawn(driver.run(force_cancel.child_token()));
+        let worker = Worker::new(client.clone(), events, store);
+        let worker_stop = CancellationToken::new();
+        let driver_task = tokio::spawn(driver.run());
+        let worker_dropped = Arc::new(AtomicBool::new(false));
+        let drop_flag = DropFlag(Arc::clone(&worker_dropped));
         let worker_task = if stall_worker {
             tokio::spawn(async move {
+                let _drop_flag = drop_flag;
                 pending::<()>().await;
                 drop(worker);
                 Ok(())
             })
         } else {
-            tokio::spawn(worker.run(force_cancel.child_token()))
+            let stop = worker_stop.clone();
+            tokio::spawn(async move {
+                let _drop_flag = drop_flag;
+                worker.run(stop).await
+            })
         };
         ready.await.unwrap().unwrap();
 
-        P2pService {
-            driver: client,
-            worker: worker_handle,
-            driver_task: Some(driver_task),
-            worker_task: Some(worker_task),
-            force_cancel,
-        }
+        (
+            P2pService {
+                driver: Some(client),
+                worker_stop,
+                driver_task: Some(driver_task),
+                worker_task: Some(worker_task),
+            },
+            worker_dropped,
+        )
     }
 
     fn test_config() -> P2pConfig {

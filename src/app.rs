@@ -46,7 +46,7 @@ impl App {
 
         let runtime_result = match exit {
             AppExit::Requested(request_result) => {
-                let shutdown_result = match p2p.as_mut() {
+                let shutdown_result = match p2p.take() {
                     Some(service) => service.shutdown(config.runtime.shutdown_timeout).await,
                     None => Ok(()),
                 };
@@ -55,7 +55,7 @@ impl App {
             }
             AppExit::P2pTask(task) => {
                 let error = task.into_error();
-                if let Some(service) = p2p.as_mut() {
+                if let Some(service) = p2p.take() {
                     service.force_shutdown().await;
                 }
                 Err(error)

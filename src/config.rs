@@ -167,14 +167,21 @@ impl Config {
             ));
         }
 
+        let runtime = RuntimeConfig {
+            control_socket: file.runtime.control_socket,
+            shutdown_timeout: Duration::from_secs(file.runtime.shutdown_timeout_secs),
+        };
         let proof_store = validate_proof_store(file.proof_store)?;
         let p2p = validate_p2p(file.p2p, proof_store.max_proof_bytes)?;
+        if p2p.enabled && runtime.shutdown_timeout <= p2p.proof_request_timeout {
+            return Err(Error::InvalidConfig(
+                "runtime.shutdown_timeout_secs must be greater than p2p.proof_request_timeout_secs when P2P is enabled"
+                    .to_owned(),
+            ));
+        }
 
         Ok(Self {
-            runtime: RuntimeConfig {
-                control_socket: file.runtime.control_socket,
-                shutdown_timeout: Duration::from_secs(file.runtime.shutdown_timeout_secs),
-            },
+            runtime,
             proof_store,
             p2p,
         })
@@ -379,7 +386,7 @@ mod tests {
             r#"
                 [runtime]
                 control_socket = "/tmp/control.sock"
-                shutdown_timeout_secs = 10
+                shutdown_timeout_secs = 15
 
                 [p2p]
                 enabled = true
@@ -394,6 +401,30 @@ mod tests {
         assert!(config.p2p.enabled);
         assert_eq!(config.p2p.chain_id, "pulsar-test");
         assert_eq!(config.p2p.max_proof_bytes, 8 * 1024 * 1024);
+    }
+
+    #[test]
+    fn rejects_p2p_request_timeout_without_shutdown_margin() {
+        let file = config_file(
+            r#"
+                [runtime]
+                control_socket = "/tmp/control.sock"
+                shutdown_timeout_secs = 10
+
+                [p2p]
+                enabled = true
+                chain_id = "pulsar-test"
+                listen_addresses = ["/ip4/0.0.0.0/tcp/39000"]
+                validator_key_path = "/tmp/priv_validator_key.json"
+                proof_request_timeout_secs = 10
+            "#,
+        );
+
+        assert!(matches!(
+            Config::from_file(file.path()),
+            Err(Error::InvalidConfig(message))
+                if message.contains("shutdown_timeout_secs must be greater")
+        ));
     }
 
     #[test]

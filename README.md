@@ -18,7 +18,9 @@ Both commands use `config/default.toml` when `--config` is omitted. `run` also h
 
 The crate-private `P2pService` owns the network Driver, the ProofStore/network Worker, and both task lifecycles. Other application components interact through ProofStore state and notifications rather than a public P2P command client.
 
-P2P shutdown is ordered: the Driver first stops accepting new work and drains accepted proof exchanges, the internal Worker drains queued store/network completions, and the Driver then exits. The configured runtime timeout applies to this complete sequence; exceeding it force-stops remaining tasks and returns an error.
+P2P shutdown is ordered: the Driver first stops accepting new work and drains accepted proof exchanges, the internal Worker drains queued store/network completions, and dropping the final private Driver client closes the drained Driver. Task joins are the completion acknowledgements for both components. The configured runtime timeout applies to this complete sequence; exceeding it force-stops and joins the remaining tasks.
+
+When P2P is enabled, `runtime.shutdown_timeout_secs` must be greater than `p2p.proof_request_timeout_secs`. This leaves the Driver enough time to finish a proof request accepted immediately before shutdown and still complete local cleanup.
 
 ## Validator P2P
 

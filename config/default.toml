@@ -1,6 +1,6 @@
 [runtime]
 control_socket = "/tmp/pulsar-verifier/control.sock"
-shutdown_timeout_secs = 10
+shutdown_timeout_secs = 15
 
 [proof_store]
 max_capacity_bytes = 536870912

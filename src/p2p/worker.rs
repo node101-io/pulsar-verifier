@@ -1,6 +1,6 @@
 use std::{collections::HashSet, sync::Arc};
 
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -10,36 +10,12 @@ use crate::{
 
 use super::{DriverClient, DriverEvent};
 
-type CommandReply = oneshot::Sender<Result<()>>;
-
-enum WorkerCommand {
-    Shutdown { reply: CommandReply },
-}
-
-/// Private lifecycle facade for the worker joining network and store events.
-#[derive(Clone)]
-pub(super) struct WorkerHandle {
-    commands: mpsc::Sender<WorkerCommand>,
-}
-
-impl WorkerHandle {
-    pub(super) async fn shutdown(&self) -> Result<()> {
-        let (reply, response) = oneshot::channel();
-        self.commands
-            .send(WorkerCommand::Shutdown { reply })
-            .await
-            .map_err(|_| Error::P2pWorkerClosed)?;
-        response.await.map_err(|_| Error::P2pWorkerClosed)?
-    }
-}
-
 /// Processes network/store events while the driver remains the sole Swarm owner.
 pub(super) struct Worker {
     driver: DriverClient,
     driver_events: mpsc::Receiver<DriverEvent>,
     store: Arc<ProofStore>,
     store_events: ProofStoreSubscription,
-    commands: mpsc::Receiver<WorkerCommand>,
 }
 
 impl Worker {
@@ -47,42 +23,25 @@ impl Worker {
         driver: DriverClient,
         driver_events: mpsc::Receiver<DriverEvent>,
         store: Arc<ProofStore>,
-        event_buffer: usize,
-    ) -> (Self, WorkerHandle) {
+    ) -> Self {
         let store_events = store.subscribe();
-        let (command_tx, commands) = mpsc::channel(event_buffer.max(1));
-        (
-            Self {
-                driver,
-                driver_events,
-                store,
-                store_events,
-                commands,
-            },
-            WorkerHandle {
-                commands: command_tx,
-            },
-        )
+        Self {
+            driver,
+            driver_events,
+            store,
+            store_events,
+        }
     }
 
-    pub(super) async fn run(mut self, force_cancel: CancellationToken) -> Result<()> {
+    pub(super) async fn run(mut self, stop: CancellationToken) -> Result<()> {
         self.reconcile_local_proofs().await?;
         loop {
             tokio::select! {
-                () = force_cancel.cancelled() => return Ok(()),
-                command = self.commands.recv() => {
-                    let command = command.ok_or(Error::P2pWorkerClosed)?;
-                    match command {
-                        WorkerCommand::Shutdown { reply } => {
-                            let result = self.drain().await;
-                            let should_stop = result.is_ok();
-                            let _ = reply.send(result);
-                            if should_stop {
-                                tracing::info!("p2p worker drained");
-                                return Ok(());
-                            }
-                        }
-                    }
+                () = stop.cancelled() => {
+                    tracing::info!("p2p worker drain started");
+                    self.drain().await?;
+                    tracing::info!("p2p worker drained");
+                    return Ok(());
                 }
                 event = self.driver_events.recv() => {
                     let event = event.ok_or(Error::P2pDriverClosed)?;
