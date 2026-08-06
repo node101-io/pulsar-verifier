@@ -16,7 +16,9 @@ cargo run -- stop --config config/default.toml
 
 Both commands use `config/default.toml` when `--config` is omitted. `run` also handles `Ctrl-C` and `SIGTERM` through the same graceful shutdown path. P2P starts when explicitly enabled; RPC and cryptographic verification services are not implemented yet.
 
-P2P shutdown is ordered: the driver first stops accepting new work and drains accepted proof exchanges, the P2P event loop drains queued store/network completions, and the driver then exits. The configured runtime timeout applies to this complete sequence; exceeding it force-stops remaining tasks and returns an error.
+The crate-private `P2pService` owns the network Driver, the ProofStore/network Worker, and both task lifecycles. Other application components interact through ProofStore state and notifications rather than a public P2P command client.
+
+P2P shutdown is ordered: the Driver first stops accepting new work and drains accepted proof exchanges, the internal Worker drains queued store/network completions, and the Driver then exits. The configured runtime timeout applies to this complete sequence; exceeding it force-stops remaining tasks and returns an error.
 
 ## Validator P2P
 

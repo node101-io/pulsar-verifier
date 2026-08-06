@@ -9,7 +9,8 @@ use pulsar_verifier_proto::v1::{
 
 use crate::{Error, Result};
 
-use super::{ProofHash, QueryId, types::QUERY_ID_LEN};
+use super::{QueryId, types::QUERY_ID_LEN};
+use crate::proof::ProofHash;
 
 #[derive(Debug)]
 pub(crate) enum ValidatedAvailability {

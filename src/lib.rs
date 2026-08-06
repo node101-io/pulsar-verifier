@@ -1,12 +1,12 @@
 pub mod cli;
 pub mod config;
-pub mod p2p;
 pub mod proof;
 pub mod store;
 
 mod app;
 mod control;
 mod error;
+mod p2p;
 mod telemetry;
 
 use app::App;

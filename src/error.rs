@@ -78,8 +78,8 @@ pub enum Error {
     #[error("P2P driver must be drained before shutdown")]
     P2pNotDrained,
 
-    #[error("P2P event loop is closed")]
-    P2pEventLoopClosed,
+    #[error("P2P worker is closed")]
+    P2pWorkerClosed,
 
     #[error("P2P driver is closed")]
     P2pDriverClosed,

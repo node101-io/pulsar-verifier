@@ -8,85 +8,85 @@ use crate::{
     store::{ProofStore, ProofStoreEvent, ProofStoreSubscription},
 };
 
-use super::{P2pEvent, P2pHandle};
+use super::{DriverClient, DriverEvent};
 
 type CommandReply = oneshot::Sender<Result<()>>;
 
-enum EventLoopCommand {
+enum WorkerCommand {
     Shutdown { reply: CommandReply },
 }
 
-/// Lifecycle facade for the task that joins P2P events with the proof store.
+/// Private lifecycle facade for the worker joining network and store events.
 #[derive(Clone)]
-pub(crate) struct P2pEventLoopHandle {
-    commands: mpsc::Sender<EventLoopCommand>,
+pub(super) struct WorkerHandle {
+    commands: mpsc::Sender<WorkerCommand>,
 }
 
-impl P2pEventLoopHandle {
-    pub(crate) async fn shutdown(&self) -> Result<()> {
+impl WorkerHandle {
+    pub(super) async fn shutdown(&self) -> Result<()> {
         let (reply, response) = oneshot::channel();
         self.commands
-            .send(EventLoopCommand::Shutdown { reply })
+            .send(WorkerCommand::Shutdown { reply })
             .await
-            .map_err(|_| Error::P2pEventLoopClosed)?;
-        response.await.map_err(|_| Error::P2pEventLoopClosed)?
+            .map_err(|_| Error::P2pWorkerClosed)?;
+        response.await.map_err(|_| Error::P2pWorkerClosed)?
     }
 }
 
 /// Processes network/store events while the driver remains the sole Swarm owner.
-pub(crate) struct P2pEventLoop {
-    handle: P2pHandle,
-    p2p_events: mpsc::Receiver<P2pEvent>,
+pub(super) struct Worker {
+    driver: DriverClient,
+    driver_events: mpsc::Receiver<DriverEvent>,
     store: Arc<ProofStore>,
     store_events: ProofStoreSubscription,
-    commands: mpsc::Receiver<EventLoopCommand>,
+    commands: mpsc::Receiver<WorkerCommand>,
 }
 
-impl P2pEventLoop {
-    pub(crate) fn new(
-        handle: P2pHandle,
-        p2p_events: mpsc::Receiver<P2pEvent>,
+impl Worker {
+    pub(super) fn new(
+        driver: DriverClient,
+        driver_events: mpsc::Receiver<DriverEvent>,
         store: Arc<ProofStore>,
         event_buffer: usize,
-    ) -> (Self, P2pEventLoopHandle) {
+    ) -> (Self, WorkerHandle) {
         let store_events = store.subscribe();
         let (command_tx, commands) = mpsc::channel(event_buffer.max(1));
         (
             Self {
-                handle,
-                p2p_events,
+                driver,
+                driver_events,
                 store,
                 store_events,
                 commands,
             },
-            P2pEventLoopHandle {
+            WorkerHandle {
                 commands: command_tx,
             },
         )
     }
 
-    pub(crate) async fn run(mut self, force_cancel: CancellationToken) -> Result<()> {
+    pub(super) async fn run(mut self, force_cancel: CancellationToken) -> Result<()> {
         self.reconcile_local_proofs().await?;
         loop {
             tokio::select! {
                 () = force_cancel.cancelled() => return Ok(()),
                 command = self.commands.recv() => {
-                    let command = command.ok_or(Error::P2pEventLoopClosed)?;
+                    let command = command.ok_or(Error::P2pWorkerClosed)?;
                     match command {
-                        EventLoopCommand::Shutdown { reply } => {
+                        WorkerCommand::Shutdown { reply } => {
                             let result = self.drain().await;
                             let should_stop = result.is_ok();
                             let _ = reply.send(result);
                             if should_stop {
-                                tracing::info!("p2p event loop drained");
+                                tracing::info!("p2p worker drained");
                                 return Ok(());
                             }
                         }
                     }
                 }
-                event = self.p2p_events.recv() => {
+                event = self.driver_events.recv() => {
                     let event = event.ok_or(Error::P2pDriverClosed)?;
-                    self.handle_p2p_event(event, false).await?;
+                    self.handle_driver_event(event, false).await?;
                 }
                 event = self.store_events.recv() => {
                     self.handle_store_result(event, false).await?;
@@ -99,10 +99,10 @@ impl P2pEventLoop {
         loop {
             let mut progressed = false;
             loop {
-                match self.p2p_events.try_recv() {
+                match self.driver_events.try_recv() {
                     Ok(event) => {
                         progressed = true;
-                        self.handle_p2p_event(event, true).await?;
+                        self.handle_driver_event(event, true).await?;
                     }
                     Err(mpsc::error::TryRecvError::Empty) => break,
                     Err(mpsc::error::TryRecvError::Disconnected) => {
@@ -137,17 +137,17 @@ impl P2pEventLoop {
         }
     }
 
-    async fn handle_p2p_event(&self, event: P2pEvent, draining: bool) -> Result<()> {
+    async fn handle_driver_event(&self, event: DriverEvent, draining: bool) -> Result<()> {
         match event {
-            P2pEvent::ProofRequested {
+            DriverEvent::ProofRequested {
                 request_id,
                 proof_hash,
                 ..
             } => {
                 let content = self.store.get_content(proof_hash).await;
-                self.handle.respond_proof(request_id, content).await?;
+                self.driver.respond_proof(request_id, content).await?;
             }
-            P2pEvent::ProofReceived { peer, content, .. } => {
+            DriverEvent::ProofReceived { peer, content, .. } => {
                 if let Err(error) = self
                     .store
                     .attach_downloaded_proof(content.proof_hash, content.proof, peer)
@@ -163,7 +163,7 @@ impl P2pEventLoop {
                     }
                 }
             }
-            P2pEvent::PeerConnected { .. } if !draining => {
+            DriverEvent::PeerConnected { .. } if !draining => {
                 self.reconcile_local_proofs().await?;
             }
             event => tracing::debug!(?event, "P2P event"),
@@ -200,13 +200,20 @@ impl P2pEventLoop {
             return Ok(());
         }
         match event {
+            ProofStoreEvent::ChainProofObserved { proof_hash } => {
+                // TODO: Start provider discovery and proof retrieval after an
+                // on-chain observation when local proof content is missing.
+                tracing::debug!(?proof_hash, "chain proof observation received");
+            }
             ProofStoreEvent::ProofStored { proof_hash, .. } => {
-                self.handle.announce(proof_hash).await?;
+                self.driver.announce(proof_hash).await?;
             }
             ProofStoreEvent::ProofEvicted { proof_hash, .. } => {
-                self.handle.forget_local_proof(proof_hash).await?;
+                self.driver.forget_local_proof(proof_hash).await?;
             }
-            event => tracing::debug!(?event, "proof store event"),
+            event @ ProofStoreEvent::VerificationChanged { .. } => {
+                tracing::debug!(?event, "proof store event");
+            }
         }
         Ok(())
     }
@@ -217,9 +224,9 @@ impl P2pEventLoop {
             .iter()
             .map(|proof| proof.hash)
             .collect::<HashSet<_>>();
-        self.handle.replace_local_proofs(hashes).await?;
+        self.driver.replace_local_proofs(hashes).await?;
         for proof in proofs {
-            self.handle.announce(proof.hash).await?;
+            self.driver.announce(proof.hash).await?;
         }
         Ok(())
     }

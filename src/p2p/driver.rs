@@ -19,10 +19,14 @@ use pulsar_verifier_proto::v1::{
 use tokio::sync::{mpsc, oneshot};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Error, Result, config::P2pConfig};
+use crate::{
+    Error, Result,
+    config::P2pConfig,
+    proof::{ProofContent, ProofHash},
+};
 
 use super::{
-    InboundProofRequestId, P2pEvent, ProofContent, ProofHash, ProofRequestId, QueryId,
+    DriverEvent, InboundProofRequestId, ProofRequestId, QueryId,
     availability::{self, AvailabilityIndex, ValidatedAvailability},
     behaviour::{self, PulsarBehaviour, PulsarBehaviourEvent},
 };
@@ -32,27 +36,31 @@ const QUERY_RESPONSE_MIN_DELAY: u64 = 50;
 const QUERY_RESPONSE_MAX_DELAY: u64 = 250;
 
 type CommandReply<T> = oneshot::Sender<Result<T>>;
-type P2pParts = (
-    P2pDriver,
-    P2pHandle,
-    mpsc::Receiver<P2pEvent>,
-    oneshot::Receiver<Result<()>>,
-);
 
-/// Cloneable application facade; the Swarm remains owned by one driver task.
-#[derive(Clone)]
-pub struct P2pHandle {
-    commands: mpsc::Sender<Command>,
+pub(super) struct DriverParts {
+    pub(super) driver: Driver,
+    pub(super) client: DriverClient,
+    pub(super) events: mpsc::Receiver<DriverEvent>,
+    pub(super) ready: oneshot::Receiver<Result<()>>,
 }
 
-impl P2pHandle {
+/// Private mailbox client; the Swarm remains owned by one driver task.
+#[derive(Clone)]
+pub(super) struct DriverClient {
+    commands: mpsc::Sender<DriverCommand>,
+}
+
+// TODO: Remove this allowance as proof retrieval and validator refresh consume
+// the remaining private command surface.
+#[allow(dead_code)]
+impl DriverClient {
     /// Dials an already authorized peer using all known transport addresses.
     ///
     /// # Errors
     ///
     /// Returns an error if the driver is unavailable or rejects the dial.
-    pub async fn dial(&self, peer: PeerId, addresses: Vec<Multiaddr>) -> Result<()> {
-        self.call(|reply| Command::Dial {
+    pub(super) async fn dial(&self, peer: PeerId, addresses: Vec<Multiaddr>) -> Result<()> {
+        self.call(|reply| DriverCommand::Dial {
             peer,
             addresses,
             reply,
@@ -65,8 +73,8 @@ impl P2pHandle {
     /// # Errors
     ///
     /// Returns an error when the driver is unavailable or publishing fails.
-    pub async fn announce(&self, proof_hash: ProofHash) -> Result<()> {
-        self.call(|reply| Command::Announce { proof_hash, reply })
+    pub(super) async fn announce(&self, proof_hash: ProofHash) -> Result<()> {
+        self.call(|reply| DriverCommand::Announce { proof_hash, reply })
             .await
     }
 
@@ -75,8 +83,8 @@ impl P2pHandle {
     /// # Errors
     ///
     /// Returns an error when the driver task is unavailable.
-    pub async fn forget_local_proof(&self, proof_hash: ProofHash) -> Result<()> {
-        self.call(|reply| Command::ForgetLocalProof { proof_hash, reply })
+    pub(super) async fn forget_local_proof(&self, proof_hash: ProofHash) -> Result<()> {
+        self.call(|reply| DriverCommand::ForgetLocalProof { proof_hash, reply })
             .await
     }
 
@@ -85,8 +93,11 @@ impl P2pHandle {
     /// # Errors
     ///
     /// Returns an error when the driver task is unavailable.
-    pub async fn replace_local_proofs(&self, proof_hashes: HashSet<ProofHash>) -> Result<()> {
-        self.call(|reply| Command::ReplaceLocalProofs {
+    pub(super) async fn replace_local_proofs(
+        &self,
+        proof_hashes: HashSet<ProofHash>,
+    ) -> Result<()> {
+        self.call(|reply| DriverCommand::ReplaceLocalProofs {
             proof_hashes,
             reply,
         })
@@ -98,8 +109,8 @@ impl P2pHandle {
     /// # Errors
     ///
     /// Returns an error when the driver is unavailable or publishing fails.
-    pub async fn query_availability(&self, proof_hash: ProofHash) -> Result<QueryId> {
-        self.call(|reply| Command::QueryAvailability { proof_hash, reply })
+    pub(super) async fn query_availability(&self, proof_hash: ProofHash) -> Result<QueryId> {
+        self.call(|reply| DriverCommand::QueryAvailability { proof_hash, reply })
             .await
     }
 
@@ -108,8 +119,8 @@ impl P2pHandle {
     /// # Errors
     ///
     /// Returns an error when the driver task is unavailable.
-    pub async fn providers(&self, proof_hash: ProofHash) -> Result<Vec<PeerId>> {
-        self.call(|reply| Command::Providers { proof_hash, reply })
+    pub(super) async fn providers(&self, proof_hash: ProofHash) -> Result<Vec<PeerId>> {
+        self.call(|reply| DriverCommand::Providers { proof_hash, reply })
             .await
     }
 
@@ -118,12 +129,12 @@ impl P2pHandle {
     /// # Errors
     ///
     /// Returns an error for unauthorized peers, duplicate requests, or driver failure.
-    pub async fn request_proof(
+    pub(super) async fn request_proof(
         &self,
         peer: PeerId,
         proof_hash: ProofHash,
     ) -> Result<ProofRequestId> {
-        self.call(|reply| Command::RequestProof {
+        self.call(|reply| DriverCommand::RequestProof {
             peer,
             proof_hash,
             reply,
@@ -136,12 +147,12 @@ impl P2pHandle {
     /// # Errors
     ///
     /// Returns an error for an unknown token, invalid content, or closed driver.
-    pub async fn respond_proof(
+    pub(super) async fn respond_proof(
         &self,
         request_id: InboundProofRequestId,
         content: Option<ProofContent>,
     ) -> Result<()> {
-        self.call(|reply| Command::RespondProof {
+        self.call(|reply| DriverCommand::RespondProof {
             request_id,
             content,
             reply,
@@ -154,8 +165,8 @@ impl P2pHandle {
     /// # Errors
     ///
     /// Returns an error when the driver task is unavailable.
-    pub async fn replace_authorized_peers(&self, peers: HashSet<PeerId>) -> Result<()> {
-        self.call(|reply| Command::ReplaceAuthorizedPeers { peers, reply })
+    pub(super) async fn replace_authorized_peers(&self, peers: HashSet<PeerId>) -> Result<()> {
+        self.call(|reply| DriverCommand::ReplaceAuthorizedPeers { peers, reply })
             .await
     }
 
@@ -164,8 +175,8 @@ impl P2pHandle {
     /// # Errors
     ///
     /// Returns an error when the driver is closed or already draining.
-    pub async fn drain(&self) -> Result<()> {
-        self.call(|reply| Command::Drain { reply }).await
+    pub(super) async fn drain(&self) -> Result<()> {
+        self.call(|reply| DriverCommand::Drain { reply }).await
     }
 
     /// Stops a driver after its accepted work has drained.
@@ -173,11 +184,11 @@ impl P2pHandle {
     /// # Errors
     ///
     /// Returns an error when the driver is closed or has not drained.
-    pub async fn shutdown(&self) -> Result<()> {
-        self.call(|reply| Command::Shutdown { reply }).await
+    pub(super) async fn shutdown(&self) -> Result<()> {
+        self.call(|reply| DriverCommand::Shutdown { reply }).await
     }
 
-    async fn call<T>(&self, command: impl FnOnce(CommandReply<T>) -> Command) -> Result<T> {
+    async fn call<T>(&self, command: impl FnOnce(CommandReply<T>) -> DriverCommand) -> Result<T> {
         let (reply, response) = oneshot::channel();
         self.commands
             .send(command(reply))
@@ -187,7 +198,8 @@ impl P2pHandle {
     }
 }
 
-enum Command {
+#[allow(dead_code)]
+enum DriverCommand {
     Dial {
         peer: PeerId,
         addresses: Vec<Multiaddr>,
@@ -254,7 +266,7 @@ struct InboundProofRequest {
 }
 
 /// Single owner of transport state, protocol behaviours and request correlation.
-pub struct P2pDriver {
+pub(super) struct Driver {
     swarm: Swarm<PulsarBehaviour>,
     config: P2pConfig,
     local_peer_id: PeerId,
@@ -267,8 +279,8 @@ pub struct P2pDriver {
     inbound_requests: HashMap<InboundProofRequestId, InboundProofRequest>,
     next_proof_request_id: u64,
     next_inbound_request_id: u64,
-    commands: mpsc::Receiver<Command>,
-    events: mpsc::Sender<P2pEvent>,
+    commands: mpsc::Receiver<DriverCommand>,
+    events: mpsc::Sender<DriverEvent>,
     delayed_responses: FuturesUnordered<futures::future::BoxFuture<'static, Vec<u8>>>,
     pending_listeners: HashSet<libp2p::core::transport::ListenerId>,
     listeners: HashSet<libp2p::core::transport::ListenerId>,
@@ -276,17 +288,17 @@ pub struct P2pDriver {
     state: DriverState,
 }
 
-impl P2pDriver {
+impl Driver {
     /// Builds a driver and its bounded application channels without spawning tasks.
     ///
     /// # Errors
     ///
     /// Returns an error for invalid transports, listeners, bootnodes or behaviour config.
-    pub fn new(
+    pub(super) fn build(
         config: P2pConfig,
         identity: identity::Keypair,
         mut authorized_peers: HashSet<PeerId>,
-    ) -> Result<P2pParts> {
+    ) -> Result<DriverParts> {
         let local_peer_id = identity.public().to_peer_id();
         authorized_peers.remove(&local_peer_id);
         let (behaviour, topic) =
@@ -339,8 +351,8 @@ impl P2pDriver {
         let (events, event_rx) = mpsc::channel(config.event_buffer);
         let (ready_tx, ready_rx) = oneshot::channel();
 
-        Ok((
-            Self {
+        Ok(DriverParts {
+            driver: Self {
                 swarm,
                 config,
                 local_peer_id,
@@ -361,12 +373,12 @@ impl P2pDriver {
                 ready: Some(ready_tx),
                 state: DriverState::Running,
             },
-            P2pHandle {
+            client: DriverClient {
                 commands: command_tx,
             },
-            event_rx,
-            ready_rx,
-        ))
+            events: event_rx,
+            ready: ready_rx,
+        })
     }
 
     /// Runs until ordered shutdown, force cancellation, or an unrecoverable failure.
@@ -374,7 +386,7 @@ impl P2pDriver {
     /// # Errors
     ///
     /// Returns an error when the command channel closes unexpectedly or a fatal event occurs.
-    pub async fn run(mut self, cancellation: CancellationToken) -> Result<()> {
+    pub(super) async fn run(mut self, cancellation: CancellationToken) -> Result<()> {
         let mut cleanup = tokio::time::interval(Duration::from_secs(1));
         loop {
             let should_stop = tokio::select! {
@@ -405,26 +417,26 @@ impl P2pDriver {
         }
     }
 
-    fn handle_command(&mut self, command: Command) -> bool {
+    fn handle_command(&mut self, command: DriverCommand) -> bool {
         match command {
-            Command::Dial {
+            DriverCommand::Dial {
                 peer,
                 addresses,
                 reply,
             } => {
                 let _ = reply.send(self.dial(peer, addresses));
             }
-            Command::Announce { proof_hash, reply } => {
+            DriverCommand::Announce { proof_hash, reply } => {
                 let _ = reply.send(self.announce(proof_hash));
             }
-            Command::ForgetLocalProof { proof_hash, reply } => {
+            DriverCommand::ForgetLocalProof { proof_hash, reply } => {
                 self.availability
                     .remove_provider(proof_hash, self.local_peer_id);
                 // TODO: Add availability leases and periodic re-announcement so remote
                 // peers eventually discard ownership that could not be withdrawn.
                 let _ = reply.send(Ok(()));
             }
-            Command::ReplaceLocalProofs {
+            DriverCommand::ReplaceLocalProofs {
                 proof_hashes,
                 reply,
             } => {
@@ -432,27 +444,27 @@ impl P2pDriver {
                     .replace_provider_proofs(self.local_peer_id, &proof_hashes);
                 let _ = reply.send(Ok(()));
             }
-            Command::QueryAvailability { proof_hash, reply } => {
+            DriverCommand::QueryAvailability { proof_hash, reply } => {
                 let _ = reply.send(self.query_availability(proof_hash));
             }
-            Command::Providers { proof_hash, reply } => {
+            DriverCommand::Providers { proof_hash, reply } => {
                 let _ = reply.send(Ok(self.availability.providers(proof_hash)));
             }
-            Command::RequestProof {
+            DriverCommand::RequestProof {
                 peer,
                 proof_hash,
                 reply,
             } => {
                 let _ = reply.send(self.request_proof(peer, proof_hash));
             }
-            Command::RespondProof {
+            DriverCommand::RespondProof {
                 request_id,
                 content,
                 reply,
             } => {
                 let _ = reply.send(self.respond_proof(request_id, content));
             }
-            Command::ReplaceAuthorizedPeers { peers, reply } => {
+            DriverCommand::ReplaceAuthorizedPeers { peers, reply } => {
                 if self.is_running() {
                     self.replace_authorized_peers(peers);
                     let _ = reply.send(Ok(()));
@@ -460,7 +472,7 @@ impl P2pDriver {
                     let _ = reply.send(Err(Error::P2pDraining));
                 }
             }
-            Command::Drain { reply } => match self.state {
+            DriverCommand::Drain { reply } => match self.state {
                 DriverState::Running => {
                     self.begin_drain(reply);
                 }
@@ -471,7 +483,7 @@ impl P2pDriver {
                     let _ = reply.send(Ok(()));
                 }
             },
-            Command::Shutdown { reply } => {
+            DriverCommand::Shutdown { reply } => {
                 if matches!(self.state, DriverState::Drained) {
                     let _ = reply.send(Ok(()));
                     return true;
@@ -700,7 +712,7 @@ impl P2pDriver {
                 self.listeners.insert(listener_id);
                 self.pending_listeners.remove(&listener_id);
                 if self.is_running() {
-                    self.emit(P2pEvent::Listening { address }).await;
+                    self.emit(DriverEvent::Listening { address }).await;
                 }
                 if self.pending_listeners.is_empty() {
                     if let Some(ready) = self.ready.take() {
@@ -722,7 +734,8 @@ impl P2pDriver {
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
                 if self.is_running() {
-                    self.emit(P2pEvent::PeerConnected { peer: peer_id }).await;
+                    self.emit(DriverEvent::PeerConnected { peer: peer_id })
+                        .await;
                 }
             }
             SwarmEvent::ConnectionClosed {
@@ -732,7 +745,7 @@ impl P2pDriver {
             } => {
                 self.availability.remove_peer(peer_id);
                 if self.is_running() {
-                    self.emit(P2pEvent::PeerDisconnected { peer: peer_id })
+                    self.emit(DriverEvent::PeerDisconnected { peer: peer_id })
                         .await;
                 }
             }
@@ -800,7 +813,7 @@ impl P2pDriver {
         match payload {
             ValidatedAvailability::Announcement { proof_hash } => {
                 self.availability.add(proof_hash, source);
-                self.emit(P2pEvent::AvailabilityAnnounced {
+                self.emit(DriverEvent::AvailabilityAnnounced {
                     peer: source,
                     proof_hash,
                 })
@@ -842,7 +855,7 @@ impl P2pDriver {
                     .get(&query_id)
                     .is_some_and(|(expected, _)| *expected == proof_hash)
                 {
-                    self.emit(P2pEvent::ProvidersDiscovered {
+                    self.emit(DriverEvent::ProvidersDiscovered {
                         query_id,
                         proof_hash,
                         providers,
@@ -878,7 +891,7 @@ impl P2pDriver {
             } => {
                 if let Some(request) = self.outbound_requests.remove(&request_id) {
                     self.in_flight.remove(&(request.peer, request.proof_hash));
-                    self.emit(P2pEvent::ProofRequestFailed {
+                    self.emit(DriverEvent::ProofRequestFailed {
                         request_id: request.application_id,
                         peer,
                         reason: error.to_string(),
@@ -933,7 +946,7 @@ impl P2pDriver {
             },
         );
         if !self
-            .emit(P2pEvent::ProofRequested {
+            .emit(DriverEvent::ProofRequested {
                 request_id,
                 peer,
                 proof_hash,
@@ -974,7 +987,7 @@ impl P2pDriver {
                     }
                 };
                 self.availability.add(request.proof_hash, peer);
-                self.emit(P2pEvent::ProofReceived {
+                self.emit(DriverEvent::ProofReceived {
                     request_id: request.application_id,
                     peer,
                     content,
@@ -983,7 +996,7 @@ impl P2pDriver {
             }
             Some(get_proof_response::Result::NotFound(_)) => {
                 self.availability.remove_provider(request.proof_hash, peer);
-                self.emit(P2pEvent::ProofNotFound {
+                self.emit(DriverEvent::ProofNotFound {
                     request_id: request.application_id,
                     peer,
                     proof_hash: request.proof_hash,
@@ -998,7 +1011,7 @@ impl P2pDriver {
     }
 
     async fn emit_failed(&mut self, request: &OutboundProofRequest, reason: &str) {
-        self.emit(P2pEvent::ProofRequestFailed {
+        self.emit(DriverEvent::ProofRequestFailed {
             request_id: request.application_id,
             peer: request.peer,
             reason: reason.to_owned(),
@@ -1006,7 +1019,7 @@ impl P2pDriver {
         .await;
     }
 
-    fn emit(&self, event: P2pEvent) -> impl Future<Output = bool> + Send + 'static {
+    fn emit(&self, event: DriverEvent) -> impl Future<Output = bool> + Send + 'static {
         let events = self.events.clone();
         async move { events.send(event).await.is_ok() }
     }
