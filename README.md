@@ -1,157 +1,143 @@
 # Pulsar Verifier
 
-## Current CLI
+Pulsar Verifier is a validator sidecar for acquiring and independently verifying
+zero-knowledge proofs. The Pulsar application asks the local sidecar for completed
+verdicts and uses those verdicts while constructing vote extensions; consensus
+aggregation remains chain-owned.
 
-The current implementation provides the process lifecycle required by the upcoming P2P and RPC components. The verifier runs in the foreground:
+## Current Status
+
+Implemented:
+
+- Foreground `run`/`stop` lifecycle with signal handling and a Unix control socket
+- Validator-authorized libp2p networking over QUIC with TCP/Noise/Yamux fallback
+- Signed GossipSub proof availability and direct composite proof exchange
+- Chain-compatible SHA-256 `VerificationId`
+- Ephemeral, bounded Moka `ProofStore`
+- Chain-owned verification service and `ProofType` proto code generation
+- Store lifecycle aligned with `QUEUED`, `VERIFYING`, `COMPLETED`, and `FAILED`
+- Tested request/response mapping for the chain verification service contract
+- A pinned Noir/Barretenberg 5.2.0 compatibility fixture
+
+Not yet implemented:
+
+- Running gRPC servers
+- Verification workers and the production Noir backend
+- Pulsar block/event listener and restart reconciliation
+- Consumer submission RPC and Cosmos transaction relay
+- Automatic P2P retrieval after an on-chain observation
+
+## CLI
+
+The verifier runs in the foreground:
 
 ```bash
 cargo run -- run --config config/default.toml
 ```
 
-A second terminal can request graceful shutdown through the configured Unix control socket:
+A second terminal can request graceful shutdown:
 
 ```bash
 cargo run -- stop --config config/default.toml
 ```
 
-Both commands use `config/default.toml` when `--config` is omitted. `run` also handles `Ctrl-C` and `SIGTERM` through the same graceful shutdown path. P2P starts when explicitly enabled; RPC and cryptographic verification services are not implemented yet.
+Both commands default to `config/default.toml`. `run` handles `Ctrl-C`, `SIGTERM`,
+and the control socket through the same shutdown path. P2P is disabled in the
+development config; `config/local.toml.example` shows the validator credentials,
+CometBFT endpoint, and listeners required to enable it.
 
-The crate-private `P2pService` owns the network Driver, the ProofStore/network Worker, and both task lifecycles. Other application components interact through ProofStore state and notifications rather than a public P2P command client.
+## Verification Contract
 
-P2P shutdown is ordered: the Driver first stops accepting new work and drains accepted proof exchanges, the internal Worker drains queued store/network completions, and dropping the final private Driver client closes the drained Driver. Task joins are the completion acknowledgements for both components. The configured runtime timeout applies to this complete sequence; exceeding it force-stops and joins the remaining tasks.
+The complete verification input is:
 
-When P2P is enabled, `runtime.shutdown_timeout_secs` must be greater than `p2p.proof_request_timeout_secs`. This leaves the Driver enough time to finish a proof request accepted immediately before shutdown and still complete local cleanup.
+```text
+Proof
+├── proof_type
+├── proof
+├── public_inputs
+└── verification_key
+```
+
+The canonical 32-byte identifier matches the chain implementation:
+
+```text
+proof_hash            = SHA256(proof)
+public_inputs_hash    = SHA256(public_inputs)
+verification_key_hash = SHA256(verification_key)
+
+verification_id = SHA256(
+  "pulsar/verification/v1\0" ||
+  BE32(proof_type) ||
+  proof_hash ||
+  public_inputs_hash ||
+  verification_key_hash
+)
+```
+
+The chain recognizes Mina Pickles and Noir Barretenberg proof types. The MVP
+sidecar will initially implement only Noir verification. A Mina request can
+therefore remain without a completed local verdict; it must never be reported as
+cryptographically invalid merely because the backend is unavailable.
+
+The chain-facing result contract deliberately separates:
+
+- `COMPLETED + VALID|INVALID`: a cryptographic verdict
+- `FAILED + failure`: an operational backend/runtime failure used for diagnostics
+- `UNAVAILABLE`, `QUEUED`, `VERIFYING`: local non-terminal state
+
+Only completed verdicts are returned by the consensus-facing
+`GetVerificationResults` method. `GetProofStatuses` exposes local diagnostics.
+
+## Proof Store
+
+Proof state is held in a process-local cache:
+
+```text
+Moka<VerificationId, Arc<ProofRecord>>
+```
+
+A record merges an optional complete `Proof` with chain-observation metadata.
+Either can arrive first. Verification becomes `Queued` only when both are present,
+and `begin_verification` provides a single-flight `Queued -> Verifying` claim.
+Only `Completed` records start the default 15-minute retention period; failed jobs
+remain available for explicit retry policy.
+
+The development defaults bound the cache to 512 MiB and each encoded composite
+proof to 8 MiB. Capacity eviction may remove non-terminal records to preserve the
+memory ceiling. Restarting the process loses all records and lifecycle state by
+design.
 
 ## Validator P2P
 
-P2P is disabled in `config/default.toml` so the process lifecycle can run without validator credentials. Copy `config/local.toml.example`, provide an absolute `priv_validator_key.json` path and the local CometBFT RPC URL, then set `p2p.enabled = true` to start the validator network.
+The crate-private `P2pService` owns the libp2p Driver, the ProofStore/network
+Worker, and their task lifecycle. The current network provides:
 
-The current P2P layer provides:
+- QUIC v1 with TCP/Noise/Yamux fallback
+- Startup validator authorization from CometBFT
+- Signed GossipSub availability announcements and provider queries
+- Direct transfer of the complete composite `Proof`
+- Ordered drain of accepted proof exchanges during shutdown
 
-* QUIC v1 with TCP, Noise, and Yamux fallback
-* Validator-set authorization bootstrapped once from CometBFT RPC
-* Signed GossipSub availability announcements and provider queries
-* Direct request-response transfer for complete proof packages
-* Runtime authorization replacement ready for a future Pulsar Listener event
+Availability is keyed by `VerificationId`. A downloaded proof is accepted only
+after recomputing the identifier and only when that ID was already observed
+on-chain. BLAKE3 is used solely for GossipSub message deduplication, not proof
+identity.
 
-The availability protocol identifies content by `VerificationId`. Direct proof exchange carries the proof bytes, public inputs, verification key, and numeric proof-system type required for independent verification. P2P startup remains fail-closed: the verifier checks the configured chain ID, requires a fully synced CometBFT node, and verifies that its consensus-derived PeerId belongs to the active validator set. Cryptographic verification is intentionally not connected yet.
+## Noir Compatibility
 
-## Ephemeral Proof Store
+`tests/fixtures/noir/bb-5.2.0` pins the MVP artifact format:
 
-Proof lifecycle state is held in a process-local Moka cache keyed by the chain-compatible `VerificationId`. Each ID is SHA-256 over the versioned domain, big-endian numeric proof type, and the SHA-256 digests of proof bytes, public inputs, and verification key. BLAKE3 is used only for GossipSub message deduplication and is not a domain identity.
+- Nargo `1.0.0-beta.25`
+- Barretenberg `5.2.0`
+- UltraHonk, Poseidon2, zero knowledge enabled, IPA disabled
 
-One immutable record combines chain observation metadata with an optional complete proof package, allowing either side to arrive first. Store transitions publish bounded events used by P2P to announce newly available content and answer inbound proof requests. The development defaults allow 512 MiB of weighted records and a maximum encoded composite proof size of 8 MiB. `Verified` and `Wrong` records expire 15 minutes after verification completes. Capacity eviction can remove non-terminal records to preserve the process memory limit. The store is intentionally non-persistent; restarting the verifier discards proof content and lifecycle state.
+The compatibility test is ignored in normal test runs because it requires an
+external `bb` binary and pre-provisioned CRS:
 
-Pulsar Verifier is a sidecar service responsible for proof propagation and verification within the Pulsar network.
-
-It operates alongside Pulsar consensus nodes and acts as the bridge between the network's proof propagation layer and the blockchain application layer. The verifier receives proofs from peers, validates them, and exposes an API that allows the Pulsar application to query proof status and verification results.
-
-## Motivation
-
-Pulsar relies on externally generated cryptographic proofs to drive state transitions. Before a proof can influence consensus, validators must be able to independently verify that the proof is valid.
-
-The verifier sidecar provides a dedicated execution environment for this responsibility, allowing proof processing to evolve independently from the core blockchain node.
-
-## Responsibilities
-
-The verifier has two primary responsibilities:
-
-### 1. Proof Propagation
-
-The verifier participates in a peer-to-peer network dedicated to proof dissemination.
-
-Through its P2P driver, it:
-
-* Receives proofs from peers
-* Validates proof structure and metadata
-* Stores and tracks proof lifecycle
-* Rebroadcasts proofs across the network
-* Maintains proof availability for other validators
-
-### 2. Proof Verification API
-
-The verifier exposes an API that can be consumed by the Pulsar application.
-
-Through this API, the application can:
-
-* Submit newly observed proofs
-* Query proof existence
-* Retrieve proof metadata
-* Check verification status
-* Determine whether a proof has been successfully verified
-
-The blockchain application does not perform proof verification itself. Instead, it delegates this responsibility to the verifier and consumes the resulting verification status.
-
-## High-Level Architecture
-
-```text
-                     ┌────────────────┐
-                     │ Verifier Peers │
-                     └───────┬────────┘
-                             │
-                             │ Proof Propagation
-                             ▼
-                ┌──────────────────────────┐
-                │     Pulsar Verifier      │
-                │                          │
-                │        P2P Driver        │
-                │            │             │
-                │            ▼             │
-                │    Verification Core     │
-                │            ▲             │
-                │            │             │
-                │        API Server        │
-                └────────────┬─────────────┘
-                             │
-                             │ Verification Queries
-                             ▼
-                 ┌─────────────────────────┐
-                 │     Pulsar ABCI App     │
-                 └───────────┬─────────────┘
-                             │
-                             │ Vote Extensions
-                             ▼
-                 ┌─────────────────────────┐
-                 │     Consensus Layer     │
-                 └─────────────────────────┘
+```bash
+PULSAR_BB_PATH=/absolute/path/to/bb \
+PULSAR_BB_HOME=/absolute/path/to/home \
+cargo test --test noir_compatibility -- --ignored
 ```
 
-## Consensus Integration
-
-The verifier is designed to support Pulsar's proof-driven consensus flow.
-
-At a high level:
-
-1. A proof is propagated through the verifier network.
-2. Each validator independently receives and verifies the proof using its local verifier instance.
-3. The Pulsar application queries the verifier to determine whether the proof is valid.
-4. Validators include their opinion on the proof within Vote Extensions.
-5. Once a proof receives support from at least two-thirds of the network's voting power, it is considered accepted.
-6. State transitions associated with that proof may then be executed on-chain.
-
-By separating proof verification from consensus execution, Pulsar can maintain a lightweight application layer while still allowing validators to reach decentralized agreement on proof validity.
-
-## Design Goals
-
-* Decouple proof verification from consensus execution
-* Enable independent evolution of verification logic
-* Provide efficient proof propagation across validators
-* Support deterministic consensus decisions based on validator votes
-* Maintain a simple integration surface for Pulsar nodes
-* Allow proof systems to evolve without modifying consensus-critical components
-
-## Future Work
-
-The verifier is intentionally designed as a standalone component. Future iterations may introduce:
-
-* Additional proof systems
-* Alternative propagation strategies
-* Proof indexing and querying capabilities
-* Advanced peer discovery mechanisms
-* Metrics and observability tooling
-
-## Status
-
-⚠️ Work in progress.
-
-The process lifecycle CLI, validator-authorized P2P transport, and event-driven ephemeral ProofStore are implemented. RPC services, Pulsar Listener, proof retrieval policy, and the cryptographic verification pipeline are the next implementation stages and may change as the Pulsar ecosystem matures.
+The production verifier worker/backend remains a later milestone.

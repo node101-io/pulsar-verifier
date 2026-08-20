@@ -21,8 +21,9 @@ use crate::{
 pub use event::{ProofEvictionCause, ProofSource, ProofStoreEvent, ProofStoreSubscription};
 use expiry::TerminalExpiry;
 pub use record::{
-    ChainProofStatus, ProofMetadata, ProofRecord, StoreChange, StoredProof, VerificationJob,
-    VerificationResult, VerificationState,
+    CompletedVerification, ProofMetadata, ProofRecord, StoreChange, StoredProof,
+    StoredVerificationStatus, VerificationFailure, VerificationJob, VerificationOutcome,
+    VerificationState, VerificationStatus, VerificationVerdict,
 };
 
 const METADATA_WEIGHT_BYTES: u32 = 256;
@@ -121,7 +122,7 @@ impl ProofStore {
                             chain_observed_at: Some(observed_at),
                             content_source: None,
                             content_stored_at: None,
-                            verification: VerificationState::NotStarted,
+                            verification: None,
                             completed_at: None,
                         },
                         proof: None,
@@ -133,6 +134,7 @@ impl ProofStore {
                 }
                 let mut updated = current.as_ref().clone();
                 updated.metadata.chain_observed_at = Some(observed_at);
+                queue_if_ready(&mut updated);
                 Ok::<_, Error>(Op::Put(Arc::new(updated)))
             })
             .await?;
@@ -140,6 +142,12 @@ impl ProofStore {
         let change = store_change(&result);
         if change != StoreChange::Unchanged {
             self.publish(ProofStoreEvent::VerificationObserved { verification_id });
+            if result_state(&result) == Some(&VerificationState::Queued) {
+                self.publish(ProofStoreEvent::VerificationChanged {
+                    verification_id,
+                    state: VerificationState::Queued,
+                });
+            }
         }
         Ok(change)
     }
@@ -167,7 +175,7 @@ impl ProofStore {
                             chain_observed_at: None,
                             content_source: Some(source),
                             content_stored_at: Some(stored_at),
-                            verification: VerificationState::NotStarted,
+                            verification: None,
                             completed_at: None,
                         },
                         proof: Some(proof),
@@ -181,6 +189,7 @@ impl ProofStore {
                 updated.proof = Some(proof);
                 updated.metadata.content_source = Some(source);
                 updated.metadata.content_stored_at = Some(stored_at);
+                queue_if_ready(&mut updated);
                 Ok::<_, Error>(Op::Put(Arc::new(updated)))
             })
             .await?;
@@ -191,6 +200,12 @@ impl ProofStore {
                 verification_id,
                 source,
             });
+            if result_state(&result) == Some(&VerificationState::Queued) {
+                self.publish(ProofStoreEvent::VerificationChanged {
+                    verification_id,
+                    state: VerificationState::Queued,
+                });
+            }
         }
         Ok((verification_id, change))
     }
@@ -225,6 +240,7 @@ impl ProofStore {
                 updated.proof = Some(proof);
                 updated.metadata.content_source = Some(source);
                 updated.metadata.content_stored_at = Some(stored_at);
+                queue_if_ready(&mut updated);
                 Ok::<_, Error>(Op::Put(Arc::new(updated)))
             })
             .await?;
@@ -235,6 +251,12 @@ impl ProofStore {
                 verification_id: expected_id,
                 source,
             });
+            if result_state(&result) == Some(&VerificationState::Queued) {
+                self.publish(ProofStoreEvent::VerificationChanged {
+                    verification_id: expected_id,
+                    state: VerificationState::Queued,
+                });
+            }
         }
         Ok(change)
     }
@@ -268,12 +290,12 @@ impl ProofStore {
                 let current = entry.value();
                 if current.metadata.chain_observed_at.is_none()
                     || current.proof.is_none()
-                    || current.metadata.verification != VerificationState::NotStarted
+                    || current.metadata.verification != Some(VerificationState::Queued)
                 {
                     return Ok::<_, Error>(Op::Nop);
                 }
                 let mut updated = current.as_ref().clone();
-                updated.metadata.verification = VerificationState::Verifying;
+                updated.metadata.verification = Some(VerificationState::Verifying);
                 Ok::<_, Error>(Op::Put(Arc::new(updated)))
             })
             .await?;
@@ -300,21 +322,22 @@ impl ProofStore {
         }))
     }
 
-    /// Commits the terminal cryptographic result and starts its retention period.
+    /// Commits a cryptographic verdict or an operational failure.
     ///
     /// # Errors
     ///
-    /// Returns an error unless the record is `Verifying` or already has the same result.
+    /// Returns an error unless the record is `Verifying` or already has the same outcome.
     pub async fn finish_verification(
         &self,
         verification_id: VerificationId,
-        result: VerificationResult,
+        outcome: VerificationOutcome,
     ) -> Result<StoreChange> {
-        let terminal = match result {
-            VerificationResult::Verified => VerificationState::Verified,
-            VerificationResult::Wrong => VerificationState::Wrong,
+        let next = match outcome {
+            VerificationOutcome::Completed(verdict) => VerificationState::Completed(verdict),
+            VerificationOutcome::Failed(failure) => VerificationState::Failed(failure),
         };
-        let completed_at = Instant::now();
+        let completed_at = matches!(&next, VerificationState::Completed(_)).then(Instant::now);
+        let committed = next.clone();
         let computed = self
             .records
             .entry(verification_id)
@@ -324,10 +347,10 @@ impl ProofStore {
                     reason: "record does not exist".to_owned(),
                 })?;
                 let current = entry.value();
-                if current.metadata.verification == terminal {
+                if current.metadata.verification.as_ref() == Some(&committed) {
                     return Ok::<_, Error>(Op::Nop);
                 }
-                if current.metadata.verification != VerificationState::Verifying {
+                if current.metadata.verification != Some(VerificationState::Verifying) {
                     return Err(Error::InvalidVerificationTransition {
                         verification_id,
                         reason: format!(
@@ -337,8 +360,8 @@ impl ProofStore {
                     });
                 }
                 let mut updated = current.as_ref().clone();
-                updated.metadata.verification = terminal;
-                updated.metadata.completed_at = Some(completed_at);
+                updated.metadata.verification = Some(committed);
+                updated.metadata.completed_at = completed_at;
                 Ok::<_, Error>(Op::Put(Arc::new(updated)))
             })
             .await?;
@@ -347,30 +370,102 @@ impl ProofStore {
         if change != StoreChange::Unchanged {
             self.publish(ProofStoreEvent::VerificationChanged {
                 verification_id,
-                state: terminal,
+                state: next,
             });
         }
         Ok(change)
     }
 
-    pub async fn statuses(&self, verification_ids: &[VerificationId]) -> Vec<ChainProofStatus> {
+    /// Requeues a retryable operational failure without changing proof content.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error unless the record is in a retryable failed state.
+    pub async fn retry_verification(&self, verification_id: VerificationId) -> Result<StoreChange> {
+        let computed = self
+            .records
+            .entry(verification_id)
+            .and_try_compute_with(move |entry| async move {
+                let entry = entry.ok_or_else(|| Error::InvalidVerificationTransition {
+                    verification_id,
+                    reason: "record does not exist".to_owned(),
+                })?;
+                let current = entry.value();
+                match current.metadata.verification.as_ref() {
+                    Some(VerificationState::Failed(failure)) if failure.retryable() => {}
+                    Some(VerificationState::Queued) => return Ok::<_, Error>(Op::Nop),
+                    state => {
+                        return Err(Error::InvalidVerificationTransition {
+                            verification_id,
+                            reason: format!("expected retryable Failed, found {state:?}"),
+                        });
+                    }
+                }
+                let mut updated = current.as_ref().clone();
+                updated.metadata.verification = Some(VerificationState::Queued);
+                updated.metadata.completed_at = None;
+                Ok::<_, Error>(Op::Put(Arc::new(updated)))
+            })
+            .await?;
+
+        let change = store_change(&computed);
+        if change != StoreChange::Unchanged {
+            self.publish(ProofStoreEvent::VerificationChanged {
+                verification_id,
+                state: VerificationState::Queued,
+            });
+        }
+        Ok(change)
+    }
+
+    pub async fn statuses(
+        &self,
+        verification_ids: &[VerificationId],
+    ) -> Vec<StoredVerificationStatus> {
         let mut statuses = Vec::with_capacity(verification_ids.len());
         for verification_id in verification_ids {
-            let status =
-                self.get(*verification_id)
-                    .await
-                    .map_or(ChainProofStatus::Unavailable, |record| {
-                        match record.metadata.verification {
-                            VerificationState::Verified => ChainProofStatus::Verified,
-                            VerificationState::Wrong => ChainProofStatus::Wrong,
-                            VerificationState::NotStarted | VerificationState::Verifying => {
-                                ChainProofStatus::Unavailable
-                            }
-                        }
-                    });
-            statuses.push(status);
+            let status = self.get(*verification_id).await.map_or(
+                VerificationStatus::Unavailable,
+                |record| match record.metadata.verification.as_ref() {
+                    None => VerificationStatus::Unavailable,
+                    Some(VerificationState::Queued) => VerificationStatus::Queued,
+                    Some(VerificationState::Verifying) => VerificationStatus::Verifying,
+                    Some(VerificationState::Completed(verdict)) => {
+                        VerificationStatus::Completed(*verdict)
+                    }
+                    Some(VerificationState::Failed(failure)) => {
+                        VerificationStatus::Failed(failure.clone())
+                    }
+                },
+            );
+            statuses.push(StoredVerificationStatus {
+                verification_id: *verification_id,
+                status,
+            });
         }
         statuses
+    }
+
+    /// Returns only completed verdicts, preserving the requested ID order.
+    pub async fn completed_results(
+        &self,
+        verification_ids: &[VerificationId],
+    ) -> Vec<CompletedVerification> {
+        let mut results = Vec::new();
+        for verification_id in verification_ids {
+            let Some(record) = self.get(*verification_id).await else {
+                continue;
+            };
+            if let Some(VerificationState::Completed(verdict)) =
+                record.metadata.verification.as_ref()
+            {
+                results.push(CompletedVerification {
+                    verification_id: *verification_id,
+                    verdict: *verdict,
+                });
+            }
+        }
+        results
     }
 
     pub async fn invalidate(&self, verification_id: VerificationId) {
@@ -397,7 +492,7 @@ impl ProofStore {
         self.snapshot(|record| {
             record.metadata.chain_observed_at.is_some()
                 && record.proof.is_some()
-                && record.metadata.verification == VerificationState::NotStarted
+                && record.metadata.verification == Some(VerificationState::Queued)
         })
     }
 
@@ -452,6 +547,26 @@ fn store_change(result: &CompResult<VerificationId, Arc<ProofRecord>>) -> StoreC
         CompResult::Unchanged(_) | CompResult::StillNone(_) | CompResult::Removed(_) => {
             StoreChange::Unchanged
         }
+    }
+}
+
+fn result_state(
+    result: &CompResult<VerificationId, Arc<ProofRecord>>,
+) -> Option<&VerificationState> {
+    match result {
+        CompResult::Inserted(entry)
+        | CompResult::ReplacedWith(entry)
+        | CompResult::Unchanged(entry) => entry.value().metadata.verification.as_ref(),
+        CompResult::StillNone(_) | CompResult::Removed(_) => None,
+    }
+}
+
+fn queue_if_ready(record: &mut ProofRecord) {
+    if record.metadata.chain_observed_at.is_some()
+        && record.proof.is_some()
+        && record.metadata.verification.is_none()
+    {
+        record.metadata.verification = Some(VerificationState::Queued);
     }
 }
 
@@ -557,6 +672,13 @@ mod tests {
             events.recv().await.unwrap(),
             ProofStoreEvent::VerificationObserved { verification_id } if verification_id == id
         ));
+        assert!(matches!(
+            events.recv().await.unwrap(),
+            ProofStoreEvent::VerificationChanged {
+                verification_id,
+                state: VerificationState::Queued,
+            } if verification_id == id
+        ));
         assert_eq!(
             store.observe_chain_verification(id).await.unwrap(),
             StoreChange::Unchanged
@@ -641,23 +763,129 @@ mod tests {
             1
         );
         store
-            .finish_verification(verified, VerificationResult::Verified)
+            .finish_verification(
+                verified,
+                VerificationOutcome::Completed(VerificationVerdict::Valid),
+            )
             .await
             .unwrap();
         store.begin_verification(wrong).await.unwrap().unwrap();
         store
-            .finish_verification(wrong, VerificationResult::Wrong)
+            .finish_verification(
+                wrong,
+                VerificationOutcome::Completed(VerificationVerdict::Invalid),
+            )
             .await
             .unwrap();
 
         assert_eq!(
             store.statuses(&[missing, wrong, verified]).await,
             vec![
-                ChainProofStatus::Unavailable,
-                ChainProofStatus::Wrong,
-                ChainProofStatus::Verified,
+                StoredVerificationStatus {
+                    verification_id: missing,
+                    status: VerificationStatus::Unavailable,
+                },
+                StoredVerificationStatus {
+                    verification_id: wrong,
+                    status: VerificationStatus::Completed(VerificationVerdict::Invalid),
+                },
+                StoredVerificationStatus {
+                    verification_id: verified,
+                    status: VerificationStatus::Completed(VerificationVerdict::Valid),
+                },
             ]
         );
+        assert_eq!(
+            store.completed_results(&[missing, wrong, verified]).await,
+            vec![
+                CompletedVerification {
+                    verification_id: wrong,
+                    verdict: VerificationVerdict::Invalid,
+                },
+                CompletedVerification {
+                    verification_id: verified,
+                    verdict: VerificationVerdict::Valid,
+                },
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn operational_failure_is_distinct_and_only_retryable_failure_requeues() {
+        let store = ProofStore::new(config()).unwrap();
+        let retryable = stored_chain_proof(&store, b"retryable").await;
+        store.begin_verification(retryable).await.unwrap().unwrap();
+        let failure = VerificationFailure::new("backend_timeout", "timed out", true).unwrap();
+        assert_eq!(
+            store
+                .finish_verification(retryable, VerificationOutcome::Failed(failure.clone()),)
+                .await
+                .unwrap(),
+            StoreChange::Updated
+        );
+        assert!(
+            store
+                .get(retryable)
+                .await
+                .unwrap()
+                .metadata
+                .completed_at
+                .is_none()
+        );
+        assert_eq!(
+            store
+                .finish_verification(retryable, VerificationOutcome::Failed(failure.clone()),)
+                .await
+                .unwrap(),
+            StoreChange::Unchanged
+        );
+        assert_eq!(
+            store.retry_verification(retryable).await.unwrap(),
+            StoreChange::Updated
+        );
+        assert_eq!(
+            store.statuses(&[retryable]).await[0].status,
+            VerificationStatus::Queued
+        );
+
+        let permanent = stored_chain_proof(&store, b"permanent").await;
+        store.begin_verification(permanent).await.unwrap().unwrap();
+        store
+            .finish_verification(
+                permanent,
+                VerificationOutcome::Failed(
+                    VerificationFailure::new("unsupported_backend", "not configured", false)
+                        .unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            store.retry_verification(permanent).await,
+            Err(Error::InvalidVerificationTransition { .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn failed_records_do_not_start_terminal_retention() {
+        let mut config = config();
+        config.terminal_retention = Duration::from_millis(50);
+        let store = ProofStore::new(config).unwrap();
+        let id = stored_chain_proof(&store, b"failed-retention").await;
+        store.begin_verification(id).await.unwrap().unwrap();
+        store
+            .finish_verification(
+                id,
+                VerificationOutcome::Failed(
+                    VerificationFailure::new("backend_crash", "worker exited", true).unwrap(),
+                ),
+            )
+            .await
+            .unwrap();
+
+        sleep(Duration::from_millis(1_100)).await;
+        store.run_pending_tasks().await;
+        assert!(store.get(id).await.is_some());
     }
 
     #[tokio::test]
@@ -689,7 +917,10 @@ mod tests {
         let id = stored_chain_proof(&store, b"expiring").await;
         store.begin_verification(id).await.unwrap().unwrap();
         store
-            .finish_verification(id, VerificationResult::Verified)
+            .finish_verification(
+                id,
+                VerificationOutcome::Completed(VerificationVerdict::Valid),
+            )
             .await
             .unwrap();
 

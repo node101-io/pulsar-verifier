@@ -108,4 +108,10 @@ pub enum Error {
         verification_id: VerificationId,
         reason: String,
     },
+
+    #[error("invalid verification failure: {0}")]
+    InvalidVerificationFailure(String),
+
+    #[error("invalid verification service request: {0}")]
+    InvalidVerificationRequest(String),
 }

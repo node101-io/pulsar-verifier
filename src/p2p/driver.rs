@@ -1157,7 +1157,7 @@ mod tests {
     fn rejects_unspecified_wire_proof_type() {
         let expected = proof(b"proof").verification_id();
         let wire_proof = pulsar_verifier_proto::v1::Proof {
-            proof_type: pulsar_verifier_proto::v1::ProofType::Unspecified.into(),
+            proof_type: pulsar_verifier_proto::chain_v1::ProofType::Unspecified.into(),
             proof: b"proof".to_vec(),
             public_inputs: b"inputs".to_vec(),
             verification_key: b"key".to_vec(),

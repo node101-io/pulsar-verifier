@@ -7,6 +7,7 @@ mod app;
 mod control;
 mod error;
 mod p2p;
+mod rpc;
 mod telemetry;
 
 use app::App;

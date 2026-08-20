@@ -19,8 +19,8 @@ impl TerminalExpiry {
 
     fn duration(&self, record: &ProofRecord) -> Option<Duration> {
         matches!(
-            record.metadata.verification,
-            VerificationState::Verified | VerificationState::Wrong
+            record.metadata.verification.as_ref(),
+            Some(VerificationState::Completed(_))
         )
         .then_some(self.retention)
     }

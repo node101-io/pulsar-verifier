@@ -1,7 +1,7 @@
 use std::fmt;
 
 use bytes::Bytes;
-use pulsar_verifier_proto::v1::{Proof as WireProof, ProofType as WireProofType};
+use pulsar_verifier_proto::{chain_v1::ProofType as WireProofType, v1::Proof as WireProof};
 use sha2::{Digest as _, Sha256};
 
 use crate::{Error, Result};
@@ -62,7 +62,7 @@ impl fmt::Debug for VerificationId {
     }
 }
 
-/// Proof systems supported by every validator in the current chain version.
+/// Proof systems recognized by the current chain contract.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u32)]
 pub enum ProofType {

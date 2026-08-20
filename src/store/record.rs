@@ -4,13 +4,87 @@ use crate::proof::{Proof, VerificationId};
 
 use super::event::ProofSource;
 
-/// Internal verification lifecycle; availability is derived from record content.
+use crate::{Error, Result};
+
+pub const FAILURE_CODE_MAX_BYTES: usize = 64;
+pub const FAILURE_MESSAGE_MAX_BYTES: usize = 256;
+
+/// Completed cryptographic verdict. Operational failures are represented separately.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum VerificationVerdict {
+    Valid,
+    Invalid,
+}
+
+/// Stable local diagnostic for a verifier backend or runtime failure.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct VerificationFailure {
+    code: String,
+    message: String,
+    retryable: bool,
+}
+
+impl VerificationFailure {
+    /// Validates the chain-facing failure bounds and machine-readable code format.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the code format or either wire-size bound is invalid.
+    pub fn new(
+        code: impl Into<String>,
+        message: impl Into<String>,
+        retryable: bool,
+    ) -> Result<Self> {
+        let code = code.into();
+        let message = message.into();
+        if code.is_empty() || code.len() > FAILURE_CODE_MAX_BYTES {
+            return Err(Error::InvalidVerificationFailure(format!(
+                "code must contain 1 to {FAILURE_CODE_MAX_BYTES} bytes"
+            )));
+        }
+        if !code.bytes().enumerate().all(|(index, byte)| {
+            byte.is_ascii_lowercase() || (index > 0 && (byte.is_ascii_digit() || byte == b'_'))
+        }) {
+            return Err(Error::InvalidVerificationFailure(
+                "code must start with a lowercase ASCII letter and contain only lowercase ASCII letters, digits, or underscores"
+                    .to_owned(),
+            ));
+        }
+        if message.len() > FAILURE_MESSAGE_MAX_BYTES {
+            return Err(Error::InvalidVerificationFailure(format!(
+                "message must contain at most {FAILURE_MESSAGE_MAX_BYTES} bytes"
+            )));
+        }
+        Ok(Self {
+            code,
+            message,
+            retryable,
+        })
+    }
+
+    #[must_use]
+    pub fn code(&self) -> &str {
+        &self.code
+    }
+
+    #[must_use]
+    pub fn message(&self) -> &str {
+        &self.message
+    }
+
+    #[must_use]
+    pub const fn retryable(&self) -> bool {
+        self.retryable
+    }
+}
+
+/// Internal verification lifecycle; unavailable is derived from missing prerequisites.
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum VerificationState {
-    NotStarted,
+    Queued,
     Verifying,
-    Verified,
-    Wrong,
+    Completed(VerificationVerdict),
+    Failed(VerificationFailure),
 }
 
 #[derive(Clone, Debug)]
@@ -18,7 +92,7 @@ pub struct ProofMetadata {
     pub chain_observed_at: Option<Instant>,
     pub content_source: Option<ProofSource>,
     pub content_stored_at: Option<Instant>,
-    pub verification: VerificationState,
+    pub verification: Option<VerificationState>,
     pub completed_at: Option<Instant>,
 }
 
@@ -41,17 +115,31 @@ pub struct VerificationJob {
     pub proof: Proof,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum VerificationResult {
-    Verified,
-    Wrong,
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VerificationOutcome {
+    Completed(VerificationVerdict),
+    Failed(VerificationFailure),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum VerificationStatus {
+    Unavailable,
+    Queued,
+    Verifying,
+    Completed(VerificationVerdict),
+    Failed(VerificationFailure),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct StoredVerificationStatus {
+    pub verification_id: VerificationId,
+    pub status: VerificationStatus,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum ChainProofStatus {
-    Verified,
-    Wrong,
-    Unavailable,
+pub struct CompletedVerification {
+    pub verification_id: VerificationId,
+    pub verdict: VerificationVerdict,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -59,4 +147,23 @@ pub enum StoreChange {
     Inserted,
     Updated,
     Unchanged,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn failure_enforces_wire_bounds_and_stable_code_format() {
+        let failure = VerificationFailure::new("backend_timeout", "timed out", true).unwrap();
+        assert_eq!(failure.code(), "backend_timeout");
+        assert_eq!(failure.message(), "timed out");
+        assert!(failure.retryable());
+
+        for code in ["", "BackendTimeout", "backend-timeout", "1backend"] {
+            assert!(VerificationFailure::new(code, "", false).is_err());
+        }
+        assert!(VerificationFailure::new("a".repeat(65), "", false).is_err());
+        assert!(VerificationFailure::new("backend", "m".repeat(257), false).is_err());
+    }
 }
