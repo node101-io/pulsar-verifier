@@ -6,6 +6,8 @@ use libp2p::{StreamProtocol, request_response};
 use prost::Message;
 use pulsar_verifier_proto::v1::{GetProofRequest, GetProofResponse};
 
+use crate::{Error, Result};
+
 const MAX_REQUEST_BYTES: usize = 1024;
 
 /// Length-bounded protobuf codec for direct proof exchange substreams.
@@ -15,10 +17,24 @@ pub(crate) struct ProofExchangeCodec {
 }
 
 impl ProofExchangeCodec {
-    pub(crate) const fn new(max_proof_bytes: usize) -> Self {
-        Self {
-            max_response_bytes: max_proof_bytes + MAX_REQUEST_BYTES,
-        }
+    pub(crate) fn new(max_proof_bytes: usize, chain_id: &str) -> Result<Self> {
+        // The response adds a chain ID field and a length-delimited oneof field
+        // around the canonical encoded Proof payload.
+        let chain_len = chain_id.len();
+        let max_response_bytes = max_proof_bytes
+            .checked_add(1)
+            .and_then(|size| {
+                size.checked_add(prost::encoding::encoded_len_varint(chain_len as u64))
+            })
+            .and_then(|size| size.checked_add(chain_len))
+            .and_then(|size| size.checked_add(1))
+            .and_then(|size| {
+                size.checked_add(prost::encoding::encoded_len_varint(max_proof_bytes as u64))
+            })
+            .ok_or_else(|| {
+                Error::InvalidConfig("proof exchange size limit overflows usize".to_owned())
+            })?;
+        Ok(Self { max_response_bytes })
     }
 }
 
@@ -81,9 +97,10 @@ where
     M: Message + Default,
 {
     let mut bytes = Vec::new();
-    io.take((maximum + 1) as u64)
-        .read_to_end(&mut bytes)
-        .await?;
+    let read_limit = maximum.checked_add(1).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidInput, "frame limit overflows usize")
+    })?;
+    io.take(read_limit as u64).read_to_end(&mut bytes).await?;
     if bytes.len() > maximum {
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
@@ -118,7 +135,7 @@ mod tests {
 
     #[tokio::test]
     async fn rejects_oversized_response_before_decode() {
-        let mut codec = ProofExchangeCodec::new(8);
+        let mut codec = ProofExchangeCodec::new(8, "chain").unwrap();
         let mut input = Cursor::new(vec![0_u8; codec.max_response_bytes + 1]);
 
         let result = codec

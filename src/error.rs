@@ -2,7 +2,7 @@ use std::{io, path::PathBuf, time::Duration};
 
 use thiserror::Error;
 
-use crate::proof::{ProofHash, ProofType};
+use crate::proof::VerificationId;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -81,38 +81,31 @@ pub enum Error {
     #[error("{0} task exited unexpectedly")]
     TaskExitedUnexpectedly(&'static str),
 
-    #[error("invalid proof hash: {0}")]
-    InvalidProofHash(String),
+    #[error("invalid verification ID: {0}")]
+    InvalidVerificationId(String),
 
-    #[error("invalid proof type: {0}")]
-    InvalidProofType(String),
+    #[error("unsupported proof type: {0}")]
+    UnsupportedProofType(i32),
 
     #[error("proof store error: {0}")]
     ProofStore(String),
 
-    #[error("proof {proof_hash:?} is {actual_bytes} bytes; maximum is {max_bytes}")]
+    #[error("proof {verification_id} is {actual_bytes} bytes; maximum is {max_bytes}")]
     ProofTooLarge {
-        proof_hash: ProofHash,
+        verification_id: VerificationId,
         actual_bytes: usize,
         max_bytes: usize,
     },
 
-    #[error("proof bytes do not match expected hash {0:?}")]
-    ProofHashMismatch(ProofHash),
+    #[error("proof does not match expected verification ID {0}")]
+    VerificationIdMismatch(VerificationId),
 
-    #[error("proof {proof_hash:?} type conflict: existing {existing}, incoming {incoming}")]
-    ProofTypeConflict {
-        proof_hash: ProofHash,
-        existing: ProofType,
-        incoming: ProofType,
-    },
+    #[error("verification {0} has not been observed on-chain")]
+    ProofNotObserved(VerificationId),
 
-    #[error("proof {0:?} has not been observed on-chain")]
-    ProofNotObserved(ProofHash),
-
-    #[error("invalid verification transition for proof {proof_hash:?}: {reason}")]
+    #[error("invalid verification transition for {verification_id}: {reason}")]
     InvalidVerificationTransition {
-        proof_hash: ProofHash,
+        verification_id: VerificationId,
         reason: String,
     },
 }

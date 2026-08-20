@@ -1,7 +1,7 @@
 use libp2p::PeerId;
 use tokio::sync::broadcast;
 
-use crate::proof::ProofHash;
+use crate::proof::VerificationId;
 
 use super::record::VerificationState;
 
@@ -23,19 +23,19 @@ pub enum ProofEvictionCause {
 /// Committed storage facts consumed by independent runtime components.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ProofStoreEvent {
-    ChainProofObserved {
-        proof_hash: ProofHash,
+    VerificationObserved {
+        verification_id: VerificationId,
     },
     ProofStored {
-        proof_hash: ProofHash,
+        verification_id: VerificationId,
         source: ProofSource,
     },
     VerificationChanged {
-        proof_hash: ProofHash,
+        verification_id: VerificationId,
         state: VerificationState,
     },
     ProofEvicted {
-        proof_hash: ProofHash,
+        verification_id: VerificationId,
         cause: ProofEvictionCause,
     },
 }

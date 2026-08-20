@@ -14,7 +14,7 @@ use crate::{Error, Result, config::P2pConfig};
 
 use super::codec::ProofExchangeCodec;
 
-pub(crate) const PROOF_EXCHANGE_PROTOCOL: &str = "/pulsar/verifier/proof-exchange/1";
+pub(crate) const PROOF_EXCHANGE_PROTOCOL: &str = "/pulsar/verifier/proof-exchange/2";
 
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "PulsarBehaviourEvent")]
@@ -88,7 +88,7 @@ pub(crate) fn build(
     authorized_peers: impl IntoIterator<Item = PeerId>,
 ) -> Result<(PulsarBehaviour, IdentTopic)> {
     let topic = IdentTopic::new(format!(
-        "/pulsar/verifier/{}/availability/1",
+        "/pulsar/verifier/{}/availability/2",
         config.chain_id
     ));
     let gossip_config = gossipsub::ConfigBuilder::default()
@@ -114,7 +114,7 @@ pub(crate) fn build(
     let exchange_config =
         request_response::Config::default().with_request_timeout(config.proof_request_timeout);
     let proof_exchange = request_response::Behaviour::with_codec(
-        ProofExchangeCodec::new(config.max_proof_bytes),
+        ProofExchangeCodec::new(config.max_proof_bytes, &config.chain_id)?,
         [(
             StreamProtocol::new(PROOF_EXCHANGE_PROTOCOL),
             ProtocolSupport::Full,
@@ -123,7 +123,7 @@ pub(crate) fn build(
     );
 
     let identify_behaviour = identify::Behaviour::new(identify::Config::new(
-        format!("/pulsar/verifier/{}/1", config.chain_id),
+        format!("/pulsar/verifier/{}/2", config.chain_id),
         identity.public(),
     ));
     let ping = ping::Behaviour::new(
@@ -146,7 +146,7 @@ pub(crate) fn build(
 
 fn semantic_message_id(message: &gossipsub::Message) -> MessageId {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"pulsar-availability-message-v1");
+    hasher.update(b"pulsar-availability-message-v2");
     if let Some(source) = message.source {
         hasher.update(&source.to_bytes());
     }
@@ -156,17 +156,17 @@ fn semantic_message_id(message: &gossipsub::Message) -> MessageId {
         match envelope.payload {
             Some(availability_message::Payload::Announcement(value)) => {
                 hasher.update(b"announcement");
-                hasher.update(&value.proof_hash);
+                hasher.update(&value.verification_id);
             }
             Some(availability_message::Payload::Query(value)) => {
                 hasher.update(b"query");
                 hasher.update(&value.request_id);
-                hasher.update(&value.proof_hash);
+                hasher.update(&value.verification_id);
             }
             Some(availability_message::Payload::Response(mut value)) => {
                 hasher.update(b"response");
                 hasher.update(&value.request_id);
-                hasher.update(&value.proof_hash);
+                hasher.update(&value.verification_id);
                 value.provider_peer_ids.sort();
                 for provider in value.provider_peer_ids {
                     hasher.update(&provider);
@@ -196,7 +196,7 @@ mod tests {
             chain_id: "test-chain".to_owned(),
             payload: Some(availability_message::Payload::Announcement(
                 AvailabilityAnnouncement {
-                    proof_hash: vec![7; 32],
+                    verification_id: vec![7; 32],
                 },
             )),
         };

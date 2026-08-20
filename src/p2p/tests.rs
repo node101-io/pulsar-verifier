@@ -10,11 +10,24 @@ use super::{Driver, DriverClient, DriverEvent, DriverParts, Worker};
 use crate::{
     Result,
     config::{P2pConfig, ProofStoreConfig},
-    proof::{ProofContent, ProofHash, ProofType},
+    proof::{Proof, ProofType, VerificationId},
     store::{ProofSource, ProofStore},
 };
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+fn proof(bytes: impl Into<Bytes>) -> Proof {
+    Proof {
+        proof_type: ProofType::MinaPickles,
+        proof: bytes.into(),
+        public_inputs: Bytes::from_static(b"inputs"),
+        verification_key: Bytes::from_static(b"key"),
+    }
+}
+
+fn verification_id(bytes: &'static [u8]) -> VerificationId {
+    proof(Bytes::from_static(bytes)).verification_id()
+}
 
 struct TestNode {
     peer_id: PeerId,
@@ -128,36 +141,40 @@ async fn connected_nodes(transport: &str) -> (TestNode, TestNode) {
 }
 
 #[tokio::test]
-async fn tcp_propagates_availability_and_transfers_opaque_proof() {
+async fn tcp_propagates_availability_and_transfers_complete_proof() {
     let (mut first, mut second) = connected_nodes("/ip4/127.0.0.1/tcp/0").await;
-    let proof = b"opaque-zk-proof".to_vec();
-    let proof_hash = ProofHash::digest(&proof);
+    let proof = proof(Bytes::from_static(b"opaque-zk-proof"));
+    let verification_id = proof.verification_id();
 
-    second.client.announce(proof_hash).await.unwrap();
+    second.client.announce(verification_id).await.unwrap();
     loop {
         if matches!(
             next_event(&mut first.events).await,
-            DriverEvent::AvailabilityAnnounced { peer, proof_hash: hash }
-                if peer == second.peer_id && hash == proof_hash
+            DriverEvent::AvailabilityAnnounced { peer, verification_id: id }
+                if peer == second.peer_id && id == verification_id
         ) {
             break;
         }
     }
     assert_eq!(
-        first.client.providers(proof_hash).await.unwrap(),
+        first.client.providers(verification_id).await.unwrap(),
         vec![second.peer_id]
     );
 
-    let query_id = first.client.query_availability(proof_hash).await.unwrap();
+    let query_id = first
+        .client
+        .query_availability(verification_id)
+        .await
+        .unwrap();
     loop {
         if let DriverEvent::ProvidersDiscovered {
             query_id: observed,
-            proof_hash: hash,
+            verification_id: id,
             providers,
         } = next_event(&mut first.events).await
         {
             assert_eq!(observed, query_id);
-            assert_eq!(hash, proof_hash);
+            assert_eq!(id, verification_id);
             assert_eq!(providers, vec![second.peer_id]);
             break;
         }
@@ -165,30 +182,24 @@ async fn tcp_propagates_availability_and_transfers_opaque_proof() {
 
     let outbound_id = first
         .client
-        .request_proof(second.peer_id, proof_hash)
+        .request_proof(second.peer_id, verification_id)
         .await
         .unwrap();
     let inbound_id = loop {
         if let DriverEvent::ProofRequested {
             request_id,
             peer,
-            proof_hash: hash,
+            verification_id: id,
         } = next_event(&mut second.events).await
         {
             assert_eq!(peer, first.peer_id);
-            assert_eq!(hash, proof_hash);
+            assert_eq!(id, verification_id);
             break request_id;
         }
     };
     second
         .client
-        .respond_proof(
-            inbound_id,
-            Some(ProofContent {
-                proof_hash,
-                proof: proof.clone().into(),
-            }),
-        )
+        .respond_proof(inbound_id, Some(proof.clone()))
         .await
         .unwrap();
 
@@ -196,12 +207,14 @@ async fn tcp_propagates_availability_and_transfers_opaque_proof() {
         if let DriverEvent::ProofReceived {
             request_id,
             peer,
-            content,
+            verification_id: received_id,
+            proof: received,
         } = next_event(&mut first.events).await
         {
             assert_eq!(request_id, outbound_id);
             assert_eq!(peer, second.peer_id);
-            assert_eq!(content.proof, proof);
+            assert_eq!(received_id, verification_id);
+            assert_eq!(received, proof);
             break;
         }
     }
@@ -213,27 +226,27 @@ async fn tcp_propagates_availability_and_transfers_opaque_proof() {
 #[tokio::test]
 async fn proof_not_found_clears_duplicate_in_flight_request() {
     let (mut first, mut second) = connected_nodes("/ip4/127.0.0.1/tcp/0").await;
-    let missing_hash = ProofHash::digest(b"missing-proof");
+    let missing_id = verification_id(b"missing-proof");
     let missing_request = first
         .client
-        .request_proof(second.peer_id, missing_hash)
+        .request_proof(second.peer_id, missing_id)
         .await
         .unwrap();
     assert!(
         first
             .client
-            .request_proof(second.peer_id, missing_hash)
+            .request_proof(second.peer_id, missing_id)
             .await
             .is_err()
     );
     let missing_inbound = loop {
         if let DriverEvent::ProofRequested {
             request_id,
-            proof_hash: hash,
+            verification_id: id,
             ..
         } = next_event(&mut second.events).await
         {
-            assert_eq!(hash, missing_hash);
+            assert_eq!(id, missing_id);
             break request_id;
         }
     };
@@ -245,8 +258,8 @@ async fn proof_not_found_clears_duplicate_in_flight_request() {
     loop {
         if matches!(
             next_event(&mut first.events).await,
-            DriverEvent::ProofNotFound { request_id, proof_hash: hash, .. }
-                if request_id == missing_request && hash == missing_hash
+            DriverEvent::ProofNotFound { request_id, verification_id: id, .. }
+                if request_id == missing_request && id == missing_id
         ) {
             break;
         }
@@ -350,15 +363,26 @@ async fn unauthorized_outbound_dial_is_rejected_before_transport() {
 #[tokio::test]
 async fn forgetting_local_proof_removes_it_from_provider_queries() {
     let (first, second) = connected_nodes("/ip4/127.0.0.1/tcp/0").await;
-    let proof_hash = ProofHash::digest(b"evicted-proof");
+    let verification_id = verification_id(b"evicted-proof");
 
-    first.client.announce(proof_hash).await.unwrap();
+    first.client.announce(verification_id).await.unwrap();
     assert_eq!(
-        first.client.providers(proof_hash).await.unwrap(),
+        first.client.providers(verification_id).await.unwrap(),
         vec![first.peer_id]
     );
-    first.client.forget_local_proof(proof_hash).await.unwrap();
-    assert!(first.client.providers(proof_hash).await.unwrap().is_empty());
+    first
+        .client
+        .forget_local_proof(verification_id)
+        .await
+        .unwrap();
+    assert!(
+        first
+            .client
+            .providers(verification_id)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 
     first.stop().await;
     second.stop().await;
@@ -387,7 +411,7 @@ async fn driver_rejects_new_work_after_drain_and_exits_when_mailbox_closes() {
     ));
     assert!(matches!(
         node.client
-            .query_availability(ProofHash::digest(b"proof"))
+            .query_availability(verification_id(b"proof"))
             .await,
         Err(crate::Error::P2pDraining)
     ));
@@ -418,22 +442,22 @@ async fn driver_treats_mailbox_closure_before_drain_as_fatal() {
 #[tokio::test]
 async fn drain_waits_for_an_accepted_inbound_proof_response() {
     let (mut server, client) = connected_nodes("/ip4/127.0.0.1/tcp/0").await;
-    let proof = b"accepted-before-drain".to_vec();
-    let proof_hash = ProofHash::digest(&proof);
+    let proof = proof(Bytes::from_static(b"accepted-before-drain"));
+    let verification_id = proof.verification_id();
 
     client
         .client
-        .request_proof(server.peer_id, proof_hash)
+        .request_proof(server.peer_id, verification_id)
         .await
         .unwrap();
     let request_id = loop {
         if let DriverEvent::ProofRequested {
             request_id,
-            proof_hash: requested,
+            verification_id: requested,
             ..
         } = next_event(&mut server.events).await
         {
-            assert_eq!(requested, proof_hash);
+            assert_eq!(requested, verification_id);
             break request_id;
         }
     };
@@ -447,13 +471,7 @@ async fn drain_waits_for_an_accepted_inbound_proof_response() {
     );
     server
         .client
-        .respond_proof(
-            request_id,
-            Some(ProofContent {
-                proof_hash,
-                proof: proof.into(),
-            }),
-        )
+        .respond_proof(request_id, Some(proof))
         .await
         .unwrap();
     timeout(EVENT_TIMEOUT, drain)
@@ -474,11 +492,11 @@ async fn drain_waits_for_an_accepted_inbound_proof_response() {
 #[tokio::test]
 async fn drain_waits_for_an_accepted_outbound_proof_response() {
     let (mut server, mut client) = connected_nodes("/ip4/127.0.0.1/tcp/0").await;
-    let proof_hash = ProofHash::digest(b"outbound-before-drain");
+    let verification_id = verification_id(b"outbound-before-drain");
 
     client
         .client
-        .request_proof(server.peer_id, proof_hash)
+        .request_proof(server.peer_id, verification_id)
         .await
         .unwrap();
     let request_id = loop {
@@ -499,7 +517,8 @@ async fn drain_waits_for_an_accepted_outbound_proof_response() {
     loop {
         if matches!(
             next_event(&mut client.events).await,
-            DriverEvent::ProofNotFound { proof_hash: missing, .. } if missing == proof_hash
+            DriverEvent::ProofNotFound { verification_id: missing, .. }
+                if missing == verification_id
         ) {
             break;
         }
@@ -522,18 +541,19 @@ async fn drain_waits_for_an_accepted_outbound_proof_response() {
 #[tokio::test]
 async fn inbound_request_after_drain_returns_not_found_without_application_event() {
     let (mut server, mut client) = connected_nodes("/ip4/127.0.0.1/tcp/0").await;
-    let proof_hash = ProofHash::digest(b"requested-after-drain");
+    let verification_id = verification_id(b"requested-after-drain");
     server.client.drain().await.unwrap();
 
     client
         .client
-        .request_proof(server.peer_id, proof_hash)
+        .request_proof(server.peer_id, verification_id)
         .await
         .unwrap();
     loop {
         if matches!(
             next_event(&mut client.events).await,
-            DriverEvent::ProofNotFound { proof_hash: missing, .. } if missing == proof_hash
+            DriverEvent::ProofNotFound { verification_id: missing, .. }
+                if missing == verification_id
         ) {
             break;
         }
@@ -666,21 +686,16 @@ async fn worker_reconciles_store_ownership_with_availability() {
         Arc::clone(&store),
     )
     .await;
-    let proof = Bytes::from_static(b"locally-available-proof");
-    let proof_hash = ProofHash::digest(&proof);
+    let proof = proof(Bytes::from_static(b"locally-available-proof"));
+    let verification_id = proof.verification_id();
 
     store
-        .insert_local_proof(
-            proof_hash,
-            ProofType::new("mock").unwrap(),
-            proof,
-            ProofSource::Rpc,
-        )
+        .insert_local_proof(proof, ProofSource::Rpc)
         .await
         .unwrap();
     timeout(Duration::from_secs(2), async {
         loop {
-            if node.client.providers(proof_hash).await.unwrap() == vec![node.peer_id] {
+            if node.client.providers(verification_id).await.unwrap() == vec![node.peer_id] {
                 break;
             }
             tokio::task::yield_now().await;
@@ -689,10 +704,16 @@ async fn worker_reconciles_store_ownership_with_availability() {
     .await
     .unwrap();
 
-    store.invalidate(proof_hash).await;
+    store.invalidate(verification_id).await;
     timeout(Duration::from_secs(2), async {
         loop {
-            if node.client.providers(proof_hash).await.unwrap().is_empty() {
+            if node
+                .client
+                .providers(verification_id)
+                .await
+                .unwrap()
+                .is_empty()
+            {
                 break;
             }
             tokio::task::yield_now().await;
@@ -715,20 +736,14 @@ async fn worker_serves_and_stores_chain_observed_proof() {
 
     let server_store = Arc::new(ProofStore::new(ProofStoreConfig::test_default()).unwrap());
     let client_store = Arc::new(ProofStore::new(ProofStoreConfig::test_default()).unwrap());
-    let proof = Bytes::from_static(b"store-backed-proof");
-    let proof_hash = ProofHash::digest(&proof);
-    let proof_type = ProofType::new("mock").unwrap();
+    let proof = proof(Bytes::from_static(b"store-backed-proof"));
+    let verification_id = proof.verification_id();
     server_store
-        .insert_local_proof(
-            proof_hash,
-            proof_type.clone(),
-            proof.clone(),
-            ProofSource::Rpc,
-        )
+        .insert_local_proof(proof.clone(), ProofSource::Rpc)
         .await
         .unwrap();
     client_store
-        .observe_chain_proof(proof_hash, proof_type)
+        .observe_chain_verification(verification_id)
         .await
         .unwrap();
 
@@ -755,16 +770,16 @@ async fn worker_serves_and_stores_chain_observed_proof() {
     tokio::time::sleep(Duration::from_millis(250)).await;
     client
         .client
-        .request_proof(server_peer, proof_hash)
+        .request_proof(server_peer, verification_id)
         .await
         .unwrap();
 
     timeout(Duration::from_secs(5), async {
         loop {
             if client_store
-                .get_content(proof_hash)
+                .get_proof(verification_id)
                 .await
-                .is_some_and(|content| content.proof == proof)
+                .is_some_and(|received| received == proof)
             {
                 break;
             }

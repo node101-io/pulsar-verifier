@@ -1,6 +1,6 @@
 use libp2p::{Multiaddr, PeerId};
 
-use crate::proof::{ProofContent, ProofHash};
+use crate::proof::{Proof, VerificationId};
 
 pub(super) const QUERY_ID_LEN: usize = 16;
 
@@ -41,27 +41,28 @@ pub(super) enum DriverEvent {
     },
     AvailabilityAnnounced {
         peer: PeerId,
-        proof_hash: ProofHash,
+        verification_id: VerificationId,
     },
     ProvidersDiscovered {
         query_id: QueryId,
-        proof_hash: ProofHash,
+        verification_id: VerificationId,
         providers: Vec<PeerId>,
     },
     ProofRequested {
         request_id: InboundProofRequestId,
         peer: PeerId,
-        proof_hash: ProofHash,
+        verification_id: VerificationId,
     },
     ProofReceived {
         request_id: ProofRequestId,
         peer: PeerId,
-        content: ProofContent,
+        verification_id: VerificationId,
+        proof: Proof,
     },
     ProofNotFound {
         request_id: ProofRequestId,
         peer: PeerId,
-        proof_hash: ProofHash,
+        verification_id: VerificationId,
     },
     ProofRequestFailed {
         request_id: ProofRequestId,

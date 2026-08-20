@@ -1,8 +1,6 @@
 use std::{sync::Arc, time::Instant};
 
-use bytes::Bytes;
-
-use crate::proof::{ProofHash, ProofType};
+use crate::proof::{Proof, VerificationId};
 
 use super::event::ProofSource;
 
@@ -17,7 +15,6 @@ pub enum VerificationState {
 
 #[derive(Clone, Debug)]
 pub struct ProofMetadata {
-    pub proof_type: ProofType,
     pub chain_observed_at: Option<Instant>,
     pub content_source: Option<ProofSource>,
     pub content_stored_at: Option<Instant>,
@@ -29,20 +26,19 @@ pub struct ProofMetadata {
 #[derive(Clone, Debug)]
 pub struct ProofRecord {
     pub metadata: ProofMetadata,
-    pub proof_bytes: Option<Bytes>,
+    pub proof: Option<Proof>,
 }
 
 #[derive(Clone, Debug)]
 pub struct StoredProof {
-    pub hash: ProofHash,
+    pub verification_id: VerificationId,
     pub record: Arc<ProofRecord>,
 }
 
 #[derive(Clone, Debug)]
 pub struct VerificationJob {
-    pub proof_hash: ProofHash,
-    pub proof_type: ProofType,
-    pub proof_bytes: Bytes,
+    pub verification_id: VerificationId,
+    pub proof: Proof,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]

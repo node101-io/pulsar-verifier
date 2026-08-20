@@ -1,0 +1,18 @@
+syntax = "proto3";
+
+package pulsar.verifier.v1;
+
+// Selects the verifier family using the values defined by Pulsar consensus.
+enum ProofType {
+  PROOF_TYPE_UNSPECIFIED = 0;
+  PROOF_TYPE_MINA_PICKLES = 1;
+  PROOF_TYPE_NOIR_BARRETENBERG = 2;
+}
+
+// Carries every artifact required to verify one proof independently.
+message Proof {
+  ProofType proof_type = 1;
+  bytes proof = 2;
+  bytes public_inputs = 3;
+  bytes verification_key = 4;
+}

@@ -21,7 +21,7 @@ use tokio::sync::{mpsc, oneshot};
 use crate::{
     Error, Result,
     config::P2pConfig,
-    proof::{ProofContent, ProofHash},
+    proof::{Proof, VerificationId},
 };
 
 use super::{
@@ -67,14 +67,17 @@ impl DriverClient {
         .await
     }
 
-    /// Announces local ownership of one proof hash.
+    /// Announces local ownership of one verification.
     ///
     /// # Errors
     ///
     /// Returns an error when the driver is unavailable or publishing fails.
-    pub(super) async fn announce(&self, proof_hash: ProofHash) -> Result<()> {
-        self.call(|reply| DriverCommand::Announce { proof_hash, reply })
-            .await
+    pub(super) async fn announce(&self, verification_id: VerificationId) -> Result<()> {
+        self.call(|reply| DriverCommand::Announce {
+            verification_id,
+            reply,
+        })
+        .await
     }
 
     /// Removes local ownership after proof content leaves the process cache.
@@ -82,9 +85,12 @@ impl DriverClient {
     /// # Errors
     ///
     /// Returns an error when the driver task is unavailable.
-    pub(super) async fn forget_local_proof(&self, proof_hash: ProofHash) -> Result<()> {
-        self.call(|reply| DriverCommand::ForgetLocalProof { proof_hash, reply })
-            .await
+    pub(super) async fn forget_local_proof(&self, verification_id: VerificationId) -> Result<()> {
+        self.call(|reply| DriverCommand::ForgetLocalProof {
+            verification_id,
+            reply,
+        })
+        .await
     }
 
     /// Reconciles local ownership after a lagged store event subscription.
@@ -94,23 +100,29 @@ impl DriverClient {
     /// Returns an error when the driver task is unavailable.
     pub(super) async fn replace_local_proofs(
         &self,
-        proof_hashes: HashSet<ProofHash>,
+        verification_ids: HashSet<VerificationId>,
     ) -> Result<()> {
         self.call(|reply| DriverCommand::ReplaceLocalProofs {
-            proof_hashes,
+            verification_ids,
             reply,
         })
         .await
     }
 
-    /// Broadcasts a provider lookup for one proof hash.
+    /// Broadcasts a provider lookup for one verification.
     ///
     /// # Errors
     ///
     /// Returns an error when the driver is unavailable or publishing fails.
-    pub(super) async fn query_availability(&self, proof_hash: ProofHash) -> Result<QueryId> {
-        self.call(|reply| DriverCommand::QueryAvailability { proof_hash, reply })
-            .await
+    pub(super) async fn query_availability(
+        &self,
+        verification_id: VerificationId,
+    ) -> Result<QueryId> {
+        self.call(|reply| DriverCommand::QueryAvailability {
+            verification_id,
+            reply,
+        })
+        .await
     }
 
     /// Returns providers currently known by the local ephemeral index.
@@ -118,12 +130,15 @@ impl DriverClient {
     /// # Errors
     ///
     /// Returns an error when the driver task is unavailable.
-    pub(super) async fn providers(&self, proof_hash: ProofHash) -> Result<Vec<PeerId>> {
-        self.call(|reply| DriverCommand::Providers { proof_hash, reply })
-            .await
+    pub(super) async fn providers(&self, verification_id: VerificationId) -> Result<Vec<PeerId>> {
+        self.call(|reply| DriverCommand::Providers {
+            verification_id,
+            reply,
+        })
+        .await
     }
 
-    /// Starts one opaque proof request; active-chain gating belongs to `ProofService`.
+    /// Starts one complete proof request; active-chain gating belongs to the store workflow.
     ///
     /// # Errors
     ///
@@ -131,17 +146,17 @@ impl DriverClient {
     pub(super) async fn request_proof(
         &self,
         peer: PeerId,
-        proof_hash: ProofHash,
+        verification_id: VerificationId,
     ) -> Result<ProofRequestId> {
         self.call(|reply| DriverCommand::RequestProof {
             peer,
-            proof_hash,
+            verification_id,
             reply,
         })
         .await
     }
 
-    /// Answers one inbound request with opaque content or `ProofNotFound`.
+    /// Answers one inbound request with a complete proof or `ProofNotFound`.
     ///
     /// # Errors
     ///
@@ -149,11 +164,11 @@ impl DriverClient {
     pub(super) async fn respond_proof(
         &self,
         request_id: InboundProofRequestId,
-        content: Option<ProofContent>,
+        proof: Option<Proof>,
     ) -> Result<()> {
         self.call(|reply| DriverCommand::RespondProof {
             request_id,
-            content,
+            proof,
             reply,
         })
         .await
@@ -196,33 +211,33 @@ enum DriverCommand {
         reply: CommandReply<()>,
     },
     Announce {
-        proof_hash: ProofHash,
+        verification_id: VerificationId,
         reply: CommandReply<()>,
     },
     ForgetLocalProof {
-        proof_hash: ProofHash,
+        verification_id: VerificationId,
         reply: CommandReply<()>,
     },
     ReplaceLocalProofs {
-        proof_hashes: HashSet<ProofHash>,
+        verification_ids: HashSet<VerificationId>,
         reply: CommandReply<()>,
     },
     QueryAvailability {
-        proof_hash: ProofHash,
+        verification_id: VerificationId,
         reply: CommandReply<QueryId>,
     },
     Providers {
-        proof_hash: ProofHash,
+        verification_id: VerificationId,
         reply: CommandReply<Vec<PeerId>>,
     },
     RequestProof {
         peer: PeerId,
-        proof_hash: ProofHash,
+        verification_id: VerificationId,
         reply: CommandReply<ProofRequestId>,
     },
     RespondProof {
         request_id: InboundProofRequestId,
-        content: Option<ProofContent>,
+        proof: Option<Proof>,
         reply: CommandReply<()>,
     },
     ReplaceAuthorizedPeers {
@@ -243,12 +258,12 @@ enum DriverState {
 struct OutboundProofRequest {
     application_id: ProofRequestId,
     peer: PeerId,
-    proof_hash: ProofHash,
+    verification_id: VerificationId,
 }
 
 struct InboundProofRequest {
     peer: PeerId,
-    proof_hash: ProofHash,
+    verification_id: VerificationId,
     channel: ResponseChannel<GetProofResponse>,
 }
 
@@ -260,9 +275,9 @@ pub(super) struct Driver {
     topic: gossipsub::IdentTopic,
     authorized_peers: HashSet<PeerId>,
     availability: AvailabilityIndex,
-    outstanding_queries: HashMap<QueryId, (ProofHash, Instant)>,
+    outstanding_queries: HashMap<QueryId, (VerificationId, Instant)>,
     outbound_requests: HashMap<OutboundRequestId, OutboundProofRequest>,
-    in_flight: HashSet<(PeerId, ProofHash)>,
+    in_flight: HashSet<(PeerId, VerificationId)>,
     inbound_requests: HashMap<InboundProofRequestId, InboundProofRequest>,
     next_proof_request_id: u64,
     next_inbound_request_id: u64,
@@ -415,43 +430,55 @@ impl Driver {
             } => {
                 let _ = reply.send(self.dial(peer, addresses));
             }
-            DriverCommand::Announce { proof_hash, reply } => {
-                let _ = reply.send(self.announce(proof_hash));
+            DriverCommand::Announce {
+                verification_id,
+                reply,
+            } => {
+                let _ = reply.send(self.announce(verification_id));
             }
-            DriverCommand::ForgetLocalProof { proof_hash, reply } => {
+            DriverCommand::ForgetLocalProof {
+                verification_id,
+                reply,
+            } => {
                 self.availability
-                    .remove_provider(proof_hash, self.local_peer_id);
+                    .remove_provider(verification_id, self.local_peer_id);
                 // TODO: Add availability leases and periodic re-announcement so remote
                 // peers eventually discard ownership that could not be withdrawn.
                 let _ = reply.send(Ok(()));
             }
             DriverCommand::ReplaceLocalProofs {
-                proof_hashes,
+                verification_ids,
                 reply,
             } => {
                 self.availability
-                    .replace_provider_proofs(self.local_peer_id, &proof_hashes);
+                    .replace_provider_proofs(self.local_peer_id, &verification_ids);
                 let _ = reply.send(Ok(()));
             }
-            DriverCommand::QueryAvailability { proof_hash, reply } => {
-                let _ = reply.send(self.query_availability(proof_hash));
+            DriverCommand::QueryAvailability {
+                verification_id,
+                reply,
+            } => {
+                let _ = reply.send(self.query_availability(verification_id));
             }
-            DriverCommand::Providers { proof_hash, reply } => {
-                let _ = reply.send(Ok(self.availability.providers(proof_hash)));
+            DriverCommand::Providers {
+                verification_id,
+                reply,
+            } => {
+                let _ = reply.send(Ok(self.availability.providers(verification_id)));
             }
             DriverCommand::RequestProof {
                 peer,
-                proof_hash,
+                verification_id,
                 reply,
             } => {
-                let _ = reply.send(self.request_proof(peer, proof_hash));
+                let _ = reply.send(self.request_proof(peer, verification_id));
             }
             DriverCommand::RespondProof {
                 request_id,
-                content,
+                proof,
                 reply,
             } => {
-                let _ = reply.send(self.respond_proof(request_id, content));
+                let _ = reply.send(self.respond_proof(request_id, proof));
             }
             DriverCommand::ReplaceAuthorizedPeers { peers, reply } => {
                 if self.is_running() {
@@ -496,12 +523,12 @@ impl Driver {
             .map_err(|error| Error::P2pDriver(format!("failed to dial {peer}: {error}")))
     }
 
-    fn announce(&mut self, proof_hash: ProofHash) -> Result<()> {
-        self.availability.add(proof_hash, self.local_peer_id);
+    fn announce(&mut self, verification_id: VerificationId) -> Result<()> {
+        self.availability.add(verification_id, self.local_peer_id);
         if !self.is_running() {
             return Ok(());
         }
-        let bytes = availability::announcement(&self.config.chain_id, proof_hash);
+        let bytes = availability::announcement(&self.config.chain_id, verification_id);
         self.swarm
             .behaviour_mut()
             .gossipsub
@@ -516,28 +543,32 @@ impl Driver {
             })
     }
 
-    fn query_availability(&mut self, proof_hash: ProofHash) -> Result<QueryId> {
+    fn query_availability(&mut self, verification_id: VerificationId) -> Result<QueryId> {
         self.require_running()?;
         let query_id = QueryId::random();
-        let bytes = availability::query(&self.config.chain_id, query_id, proof_hash);
+        let bytes = availability::query(&self.config.chain_id, query_id, verification_id);
         self.swarm
             .behaviour_mut()
             .gossipsub
             .publish(self.topic.clone(), bytes)
             .map_err(|error| Error::P2pDriver(format!("failed to publish query: {error}")))?;
         self.outstanding_queries
-            .insert(query_id, (proof_hash, Instant::now()));
+            .insert(query_id, (verification_id, Instant::now()));
         Ok(query_id)
     }
 
-    fn request_proof(&mut self, peer: PeerId, proof_hash: ProofHash) -> Result<ProofRequestId> {
+    fn request_proof(
+        &mut self,
+        peer: PeerId,
+        verification_id: VerificationId,
+    ) -> Result<ProofRequestId> {
         self.require_running()?;
         if !self.authorized_peers.contains(&peer) {
             return Err(Error::P2pAuthorization(format!(
                 "refusing proof request to unauthorized peer {peer}"
             )));
         }
-        if !self.in_flight.insert((peer, proof_hash)) {
+        if !self.in_flight.insert((peer, verification_id)) {
             return Err(Error::P2pDriver(format!(
                 "proof request to {peer} is already in flight"
             )));
@@ -549,7 +580,7 @@ impl Driver {
             &peer,
             GetProofRequest {
                 chain_id: self.config.chain_id.clone(),
-                proof_hash: proof_hash.as_bytes().to_vec(),
+                verification_id: verification_id.as_bytes().to_vec(),
             },
         );
         self.outbound_requests.insert(
@@ -557,7 +588,7 @@ impl Driver {
             OutboundProofRequest {
                 application_id,
                 peer,
-                proof_hash,
+                verification_id,
             },
         );
         Ok(application_id)
@@ -566,29 +597,24 @@ impl Driver {
     fn respond_proof(
         &mut self,
         request_id: InboundProofRequestId,
-        content: Option<ProofContent>,
+        proof: Option<Proof>,
     ) -> Result<()> {
         let inbound = self.inbound_requests.remove(&request_id).ok_or_else(|| {
             Error::P2pDriver(format!("unknown inbound proof request {request_id:?}"))
         })?;
-        let result = match content {
-            Some(content) => {
-                if content.proof.len() > self.config.max_proof_bytes {
+        let result = match proof {
+            Some(proof) => {
+                if proof.encoded_len() > self.config.max_proof_bytes {
                     return Err(Error::P2pProtocol(
                         "proof exceeds configured limit".to_owned(),
                     ));
                 }
-                if content.proof_hash != inbound.proof_hash
-                    || ProofHash::digest(&content.proof) != content.proof_hash
-                {
+                if proof.verification_id() != inbound.verification_id {
                     return Err(Error::P2pProtocol(
                         "proof response does not match inbound request".to_owned(),
                     ));
                 }
-                get_proof_response::Result::Content(pulsar_verifier_proto::v1::ProofContent {
-                    proof_hash: content.proof_hash.as_bytes().to_vec(),
-                    proof: content.proof.to_vec(),
-                })
+                get_proof_response::Result::Proof((&proof).into())
             }
             None => get_proof_response::Result::NotFound(ProofNotFound {}),
         };
@@ -793,24 +819,24 @@ impl Driver {
             return;
         }
         match payload {
-            ValidatedAvailability::Announcement { proof_hash } => {
-                self.availability.add(proof_hash, source);
+            ValidatedAvailability::Announcement { verification_id } => {
+                self.availability.add(verification_id, source);
                 self.emit(DriverEvent::AvailabilityAnnounced {
                     peer: source,
-                    proof_hash,
+                    verification_id,
                 })
                 .await;
             }
             ValidatedAvailability::Query {
                 query_id,
-                proof_hash,
+                verification_id,
             } => {
-                let providers = self.availability.providers(proof_hash);
+                let providers = self.availability.providers(verification_id);
                 if !providers.is_empty() {
                     let bytes = availability::response(
                         &self.config.chain_id,
                         query_id,
-                        proof_hash,
+                        verification_id,
                         &providers[..providers.len().min(MAX_PROVIDER_HINTS)],
                     );
                     let delay =
@@ -826,20 +852,20 @@ impl Driver {
             }
             ValidatedAvailability::Response {
                 query_id,
-                proof_hash,
+                verification_id,
                 providers,
             } => {
                 for provider in &providers {
-                    self.availability.add(proof_hash, *provider);
+                    self.availability.add(verification_id, *provider);
                 }
                 if self
                     .outstanding_queries
                     .get(&query_id)
-                    .is_some_and(|(expected, _)| *expected == proof_hash)
+                    .is_some_and(|(expected, _)| *expected == verification_id)
                 {
                     self.emit(DriverEvent::ProvidersDiscovered {
                         query_id,
-                        proof_hash,
+                        verification_id,
                         providers,
                     })
                     .await;
@@ -872,7 +898,8 @@ impl Driver {
                 ..
             } => {
                 if let Some(request) = self.outbound_requests.remove(&request_id) {
-                    self.in_flight.remove(&(request.peer, request.proof_hash));
+                    self.in_flight
+                        .remove(&(request.peer, request.verification_id));
                     self.emit(DriverEvent::ProofRequestFailed {
                         request_id: request.application_id,
                         peer,
@@ -902,13 +929,13 @@ impl Driver {
                 .send_response(channel, not_found_response(&self.config.chain_id));
             return;
         }
-        let proof_hash =
+        let verification_id =
             if self.authorized_peers.contains(&peer) && request.chain_id == self.config.chain_id {
-                ProofHash::try_from(request.proof_hash.as_slice()).ok()
+                VerificationId::try_from(request.verification_id.as_slice()).ok()
             } else {
                 None
             };
-        let Some(proof_hash) = proof_hash else {
+        let Some(verification_id) = verification_id else {
             let _ = self
                 .swarm
                 .behaviour_mut()
@@ -923,7 +950,7 @@ impl Driver {
             request_id,
             InboundProofRequest {
                 peer,
-                proof_hash,
+                verification_id,
                 channel,
             },
         );
@@ -931,7 +958,7 @@ impl Driver {
             .emit(DriverEvent::ProofRequested {
                 request_id,
                 peer,
-                proof_hash,
+                verification_id,
             })
             .await
         {
@@ -948,7 +975,8 @@ impl Driver {
         let Some(request) = self.outbound_requests.remove(&request_id) else {
             return;
         };
-        self.in_flight.remove(&(request.peer, request.proof_hash));
+        self.in_flight
+            .remove(&(request.peer, request.verification_id));
         if peer != request.peer || response.chain_id != self.config.chain_id {
             self.emit_failed(&request, "proof response context mismatch")
                 .await;
@@ -956,32 +984,34 @@ impl Driver {
         }
 
         match response.result {
-            Some(get_proof_response::Result::Content(content)) => {
-                let content = match validate_proof_content(
-                    content,
-                    request.proof_hash,
+            Some(get_proof_response::Result::Proof(proof)) => {
+                let proof = match validate_proof(
+                    proof,
+                    request.verification_id,
                     self.config.max_proof_bytes,
                 ) {
-                    Ok(content) => content,
+                    Ok(proof) => proof,
                     Err(error) => {
                         self.emit_failed(&request, &error.to_string()).await;
                         return;
                     }
                 };
-                self.availability.add(request.proof_hash, peer);
+                self.availability.add(request.verification_id, peer);
                 self.emit(DriverEvent::ProofReceived {
                     request_id: request.application_id,
                     peer,
-                    content,
+                    verification_id: request.verification_id,
+                    proof,
                 })
                 .await;
             }
             Some(get_proof_response::Result::NotFound(_)) => {
-                self.availability.remove_provider(request.proof_hash, peer);
+                self.availability
+                    .remove_provider(request.verification_id, peer);
                 self.emit(DriverEvent::ProofNotFound {
                     request_id: request.application_id,
                     peer,
-                    proof_hash: request.proof_hash,
+                    verification_id: request.verification_id,
                 })
                 .await;
             }
@@ -1029,57 +1059,112 @@ fn split_peer_address(mut address: Multiaddr) -> Result<(PeerId, Multiaddr)> {
     }
 }
 
-fn validate_proof_content(
-    content: pulsar_verifier_proto::v1::ProofContent,
-    expected_hash: ProofHash,
+fn validate_proof(
+    wire_proof: pulsar_verifier_proto::v1::Proof,
+    expected_id: VerificationId,
     maximum_bytes: usize,
-) -> Result<ProofContent> {
-    if content.proof.len() > maximum_bytes {
+) -> Result<Proof> {
+    use prost::Message as _;
+
+    if wire_proof.encoded_len() > maximum_bytes {
         return Err(Error::P2pProtocol(
             "proof response exceeds configured limit".to_owned(),
         ));
     }
-    let response_hash = ProofHash::try_from(content.proof_hash.as_slice())?;
-    if response_hash != expected_hash || ProofHash::digest(&content.proof) != response_hash {
+    let proof = Proof::try_from(wire_proof)
+        .map_err(|error| Error::P2pProtocol(format!("invalid proof response: {error}")))?;
+    if proof.verification_id() != expected_id {
         return Err(Error::P2pProtocol(
-            "proof response failed hash binding".to_owned(),
+            "proof response failed verification ID binding".to_owned(),
         ));
     }
-    Ok(ProofContent {
-        proof_hash: response_hash,
-        proof: content.proof.into(),
-    })
+    Ok(proof)
 }
 
 #[cfg(test)]
 mod tests {
+    use bytes::Bytes;
+
     use super::*;
+    use crate::proof::ProofType;
+
+    fn proof(bytes: &'static [u8]) -> Proof {
+        Proof {
+            proof_type: ProofType::MinaPickles,
+            proof: Bytes::from_static(bytes),
+            public_inputs: Bytes::from_static(b"inputs"),
+            verification_key: Bytes::from_static(b"key"),
+        }
+    }
 
     #[test]
     fn rejects_mismatched_proof_response_without_domain_status() {
-        let expected = ProofHash::digest(b"expected");
-        let content = pulsar_verifier_proto::v1::ProofContent {
-            proof_hash: expected.as_bytes().to_vec(),
-            proof: b"different".to_vec(),
-        };
+        let expected = proof(b"expected").verification_id();
+        let wire_proof = pulsar_verifier_proto::v1::Proof::from(&proof(b"different"));
 
         assert!(matches!(
-            validate_proof_content(content, expected, 1024),
+            validate_proof(wire_proof, expected, 1024),
             Err(Error::P2pProtocol(_))
         ));
     }
 
     #[test]
     fn rejects_oversized_proof_response() {
-        let proof = vec![1_u8; 9];
-        let hash = ProofHash::digest(&proof);
-        let content = pulsar_verifier_proto::v1::ProofContent {
-            proof_hash: hash.as_bytes().to_vec(),
-            proof,
+        let proof = Proof {
+            proof_type: ProofType::MinaPickles,
+            proof: Bytes::from(vec![1; 9]),
+            public_inputs: Bytes::new(),
+            verification_key: Bytes::new(),
+        };
+        let id = proof.verification_id();
+        let wire_proof = pulsar_verifier_proto::v1::Proof::from(&proof);
+
+        assert!(matches!(
+            validate_proof(wire_proof, id, 8),
+            Err(Error::P2pProtocol(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_each_mismatched_proof_component() {
+        let original = proof(b"proof");
+        let expected = original.verification_id();
+        let mut variants = Vec::new();
+
+        let mut changed = original.clone();
+        changed.public_inputs = Bytes::from_static(b"other-inputs");
+        variants.push(changed);
+        let mut changed = original.clone();
+        changed.verification_key = Bytes::from_static(b"other-key");
+        variants.push(changed);
+        let mut changed = original;
+        changed.proof_type = ProofType::NoirBarretenberg;
+        variants.push(changed);
+
+        for changed in variants {
+            assert!(matches!(
+                validate_proof(
+                    pulsar_verifier_proto::v1::Proof::from(&changed),
+                    expected,
+                    1024,
+                ),
+                Err(Error::P2pProtocol(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_unspecified_wire_proof_type() {
+        let expected = proof(b"proof").verification_id();
+        let wire_proof = pulsar_verifier_proto::v1::Proof {
+            proof_type: pulsar_verifier_proto::v1::ProofType::Unspecified.into(),
+            proof: b"proof".to_vec(),
+            public_inputs: b"inputs".to_vec(),
+            verification_key: b"key".to_vec(),
         };
 
         assert!(matches!(
-            validate_proof_content(content, hash, 8),
+            validate_proof(wire_proof, expected, 1024),
             Err(Error::P2pProtocol(_))
         ));
     }

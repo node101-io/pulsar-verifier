@@ -31,16 +31,16 @@ The current P2P layer provides:
 * QUIC v1 with TCP, Noise, and Yamux fallback
 * Validator-set authorization bootstrapped once from CometBFT RPC
 * Signed GossipSub availability announcements and provider queries
-* Direct request-response transfer for opaque proof bytes
+* Direct request-response transfer for complete proof packages
 * Runtime authorization replacement ready for a future Pulsar Listener event
 
-P2P startup is fail-closed: the verifier checks the configured chain ID, requires a fully synced CometBFT node, and verifies that its consensus-derived PeerId belongs to the active validator set. Proof-system routing and cryptographic verification are intentionally not connected yet.
+Availability protocol v2 identifies content by `VerificationId`. Direct proof exchange carries the proof bytes, public inputs, verification key, and numeric proof-system type required for independent verification. P2P startup remains fail-closed: the verifier checks the configured chain ID, requires a fully synced CometBFT node, and verifies that its consensus-derived PeerId belongs to the active validator set. Cryptographic verification is intentionally not connected yet.
 
 ## Ephemeral Proof Store
 
-Proof lifecycle state is held in a process-local Moka cache keyed by the canonical BLAKE3 proof hash. One immutable record combines chain-owned metadata with optional proof bytes, allowing either the chain observation or the proof content to arrive first. Store transitions publish bounded events used by P2P to announce newly available content and answer inbound proof requests.
+Proof lifecycle state is held in a process-local Moka cache keyed by the chain-compatible `VerificationId`. Each ID is SHA-256 over the versioned domain, big-endian numeric proof type, and the SHA-256 digests of proof bytes, public inputs, and verification key. BLAKE3 is used only for GossipSub message deduplication and is not a domain identity.
 
-The development defaults allow 512 MiB of weighted proof records and proofs up to 8 MiB. `Verified` and `Wrong` records expire 15 minutes after verification completes. Capacity eviction can remove non-terminal records to preserve the process memory limit. The store is intentionally non-persistent; restarting the verifier discards proof content and lifecycle state.
+One immutable record combines chain observation metadata with an optional complete proof package, allowing either side to arrive first. Store transitions publish bounded events used by P2P to announce newly available content and answer inbound proof requests. The development defaults allow 512 MiB of weighted records and a maximum encoded composite proof size of 8 MiB. `Verified` and `Wrong` records expire 15 minutes after verification completes. Capacity eviction can remove non-terminal records to preserve the process memory limit. The store is intentionally non-persistent; restarting the verifier discards proof content and lifecycle state.
 
 Pulsar Verifier is a sidecar service responsible for proof propagation and verification within the Pulsar network.
 

@@ -1,5 +1,7 @@
 /// Versioned verifier-to-verifier wire contracts.
 pub mod v1 {
+    #![allow(clippy::doc_markdown, clippy::must_use_candidate)]
+
     include!(concat!(env!("OUT_DIR"), "/pulsar.verifier.v1.rs"));
 }
 
@@ -8,7 +10,7 @@ mod tests {
     use prost::Message as _;
 
     use super::v1::{
-        AvailabilityAnnouncement, AvailabilityMessage, GetProofResponse, ProofContent,
+        AvailabilityAnnouncement, AvailabilityMessage, GetProofResponse, Proof, ProofType,
         availability_message, get_proof_response,
     };
 
@@ -18,7 +20,7 @@ mod tests {
             chain_id: "pulsar-test".to_owned(),
             payload: Some(availability_message::Payload::Announcement(
                 AvailabilityAnnouncement {
-                    proof_hash: vec![1; 32],
+                    verification_id: vec![1; 32],
                 },
             )),
         };
@@ -30,12 +32,14 @@ mod tests {
     }
 
     #[test]
-    fn proof_response_round_trip_preserves_opaque_bytes() {
+    fn proof_response_round_trip_preserves_complete_proof() {
         let response = GetProofResponse {
             chain_id: "pulsar-test".to_owned(),
-            result: Some(get_proof_response::Result::Content(ProofContent {
-                proof_hash: vec![2; 32],
+            result: Some(get_proof_response::Result::Proof(Proof {
+                proof_type: ProofType::MinaPickles.into(),
                 proof: vec![3; 128],
+                public_inputs: vec![4; 64],
+                verification_key: vec![5; 256],
             })),
         };
 

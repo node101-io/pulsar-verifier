@@ -100,21 +100,26 @@ impl Worker {
         match event {
             DriverEvent::ProofRequested {
                 request_id,
-                proof_hash,
+                verification_id,
                 ..
             } => {
-                let content = self.store.get_content(proof_hash).await;
-                self.driver.respond_proof(request_id, content).await?;
+                let proof = self.store.get_proof(verification_id).await;
+                self.driver.respond_proof(request_id, proof).await?;
             }
-            DriverEvent::ProofReceived { peer, content, .. } => {
+            DriverEvent::ProofReceived {
+                peer,
+                verification_id,
+                proof,
+                ..
+            } => {
                 if let Err(error) = self
                     .store
-                    .attach_downloaded_proof(content.proof_hash, content.proof, peer)
+                    .attach_downloaded_proof(verification_id, proof, peer)
                     .await
                 {
                     match error {
                         Error::ProofNotObserved(_)
-                        | Error::ProofHashMismatch(_)
+                        | Error::VerificationIdMismatch(_)
                         | Error::ProofTooLarge { .. } => {
                             tracing::debug!(%error, %peer, "downloaded proof was not stored");
                         }
@@ -159,16 +164,20 @@ impl Worker {
             return Ok(());
         }
         match event {
-            ProofStoreEvent::ChainProofObserved { proof_hash } => {
+            ProofStoreEvent::VerificationObserved { verification_id } => {
                 // TODO: Start provider discovery and proof retrieval after an
-                // on-chain observation when local proof content is missing.
-                tracing::debug!(?proof_hash, "chain proof observation received");
+                // on-chain verification observation when local proof content is missing.
+                tracing::debug!(?verification_id, "chain verification observation received");
             }
-            ProofStoreEvent::ProofStored { proof_hash, .. } => {
-                self.driver.announce(proof_hash).await?;
+            ProofStoreEvent::ProofStored {
+                verification_id, ..
+            } => {
+                self.driver.announce(verification_id).await?;
             }
-            ProofStoreEvent::ProofEvicted { proof_hash, .. } => {
-                self.driver.forget_local_proof(proof_hash).await?;
+            ProofStoreEvent::ProofEvicted {
+                verification_id, ..
+            } => {
+                self.driver.forget_local_proof(verification_id).await?;
             }
             event @ ProofStoreEvent::VerificationChanged { .. } => {
                 tracing::debug!(?event, "proof store event");
@@ -179,13 +188,13 @@ impl Worker {
 
     async fn reconcile_local_proofs(&self) -> Result<()> {
         let proofs = self.store.locally_available_proofs();
-        let hashes = proofs
+        let verification_ids = proofs
             .iter()
-            .map(|proof| proof.hash)
+            .map(|proof| proof.verification_id)
             .collect::<HashSet<_>>();
-        self.driver.replace_local_proofs(hashes).await?;
+        self.driver.replace_local_proofs(verification_ids).await?;
         for proof in proofs {
-            self.driver.announce(proof.hash).await?;
+            self.driver.announce(proof.verification_id).await?;
         }
         Ok(())
     }
