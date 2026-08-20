@@ -34,7 +34,7 @@ The current P2P layer provides:
 * Direct request-response transfer for complete proof packages
 * Runtime authorization replacement ready for a future Pulsar Listener event
 
-Availability protocol v2 identifies content by `VerificationId`. Direct proof exchange carries the proof bytes, public inputs, verification key, and numeric proof-system type required for independent verification. P2P startup remains fail-closed: the verifier checks the configured chain ID, requires a fully synced CometBFT node, and verifies that its consensus-derived PeerId belongs to the active validator set. Cryptographic verification is intentionally not connected yet.
+The availability protocol identifies content by `VerificationId`. Direct proof exchange carries the proof bytes, public inputs, verification key, and numeric proof-system type required for independent verification. P2P startup remains fail-closed: the verifier checks the configured chain ID, requires a fully synced CometBFT node, and verifies that its consensus-derived PeerId belongs to the active validator set. Cryptographic verification is intentionally not connected yet.
 
 ## Ephemeral Proof Store
 

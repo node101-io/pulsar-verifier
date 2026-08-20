@@ -14,7 +14,7 @@ use crate::{Error, Result, config::P2pConfig};
 
 use super::codec::ProofExchangeCodec;
 
-pub(crate) const PROOF_EXCHANGE_PROTOCOL: &str = "/pulsar/verifier/proof-exchange/2";
+pub(crate) const PROOF_EXCHANGE_PROTOCOL: &str = "/pulsar/verifier/proof-exchange/1";
 
 #[derive(NetworkBehaviour)]
 #[behaviour(to_swarm = "PulsarBehaviourEvent")]
@@ -88,7 +88,7 @@ pub(crate) fn build(
     authorized_peers: impl IntoIterator<Item = PeerId>,
 ) -> Result<(PulsarBehaviour, IdentTopic)> {
     let topic = IdentTopic::new(format!(
-        "/pulsar/verifier/{}/availability/2",
+        "/pulsar/verifier/{}/availability/1",
         config.chain_id
     ));
     let gossip_config = gossipsub::ConfigBuilder::default()
@@ -123,7 +123,7 @@ pub(crate) fn build(
     );
 
     let identify_behaviour = identify::Behaviour::new(identify::Config::new(
-        format!("/pulsar/verifier/{}/2", config.chain_id),
+        format!("/pulsar/verifier/{}/1", config.chain_id),
         identity.public(),
     ));
     let ping = ping::Behaviour::new(
@@ -146,7 +146,7 @@ pub(crate) fn build(
 
 fn semantic_message_id(message: &gossipsub::Message) -> MessageId {
     let mut hasher = blake3::Hasher::new();
-    hasher.update(b"pulsar-availability-message-v2");
+    hasher.update(b"pulsar-availability-message-v1");
     if let Some(source) = message.source {
         hasher.update(&source.to_bytes());
     }

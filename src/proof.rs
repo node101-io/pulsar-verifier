@@ -52,10 +52,7 @@ impl TryFrom<&[u8]> for VerificationId {
 
 impl fmt::Display for VerificationId {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        for byte in self.0 {
-            write!(formatter, "{byte:02x}")?;
-        }
-        Ok(())
+        formatter.write_str(&hex::encode(self.0))
     }
 }
 
