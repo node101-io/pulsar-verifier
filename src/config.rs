@@ -16,6 +16,16 @@ pub struct Config {
     pub runtime: RuntimeConfig,
     pub proof_store: ProofStoreConfig,
     pub p2p: P2pConfig,
+    pub verification: VerificationConfig,
+}
+
+/// Resource limits for asynchronous proof verification jobs.
+#[derive(Debug, Clone, Copy)]
+pub struct VerificationConfig {
+    pub max_concurrent_jobs: usize,
+    pub job_timeout: Duration,
+    pub max_retries: u32,
+    pub retry_backoff: Duration,
 }
 
 /// Process lifecycle settings shared by the `run` and `stop` commands.
@@ -75,6 +85,28 @@ struct FileConfig {
     proof_store: FileProofStoreConfig,
     #[serde(default)]
     p2p: FileP2pConfig,
+    #[serde(default)]
+    verification: FileVerificationConfig,
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(default, deny_unknown_fields)]
+struct FileVerificationConfig {
+    max_concurrent_jobs: usize,
+    job_timeout_secs: u64,
+    max_retries: u32,
+    retry_backoff_millis: u64,
+}
+
+impl Default for FileVerificationConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_jobs: 2,
+            job_timeout_secs: 30,
+            max_retries: 2,
+            retry_backoff_millis: 250,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -173,6 +205,7 @@ impl Config {
         };
         let proof_store = validate_proof_store(file.proof_store)?;
         let p2p = validate_p2p(file.p2p, proof_store.max_proof_bytes)?;
+        let verification = validate_verification(file.verification)?;
         if p2p.enabled && runtime.shutdown_timeout <= p2p.proof_request_timeout {
             return Err(Error::InvalidConfig(
                 "runtime.shutdown_timeout_secs must be greater than p2p.proof_request_timeout_secs when P2P is enabled"
@@ -184,8 +217,40 @@ impl Config {
             runtime,
             proof_store,
             p2p,
+            verification,
         })
     }
+}
+
+fn validate_verification(file: FileVerificationConfig) -> Result<VerificationConfig> {
+    if !(1..=256).contains(&file.max_concurrent_jobs) {
+        return Err(Error::InvalidConfig(
+            "verification.max_concurrent_jobs must be between 1 and 256".to_owned(),
+        ));
+    }
+    if file.job_timeout_secs == 0 {
+        return Err(Error::InvalidConfig(
+            "verification.job_timeout_secs must be greater than zero".to_owned(),
+        ));
+    }
+    if file.max_retries > 10 {
+        return Err(Error::InvalidConfig(
+            "verification.max_retries must not exceed 10".to_owned(),
+        ));
+    }
+    if file.max_retries > 0 && file.retry_backoff_millis == 0 {
+        return Err(Error::InvalidConfig(
+            "verification.retry_backoff_millis must be greater than zero when retries are enabled"
+                .to_owned(),
+        ));
+    }
+
+    Ok(VerificationConfig {
+        max_concurrent_jobs: file.max_concurrent_jobs,
+        job_timeout: Duration::from_secs(file.job_timeout_secs),
+        max_retries: file.max_retries,
+        retry_backoff: Duration::from_millis(file.retry_backoff_millis),
+    })
 }
 
 fn validate_proof_store(file: FileProofStoreConfig) -> Result<ProofStoreConfig> {
@@ -321,6 +386,13 @@ mod tests {
             Duration::from_secs(900)
         );
         assert!(!config.p2p.enabled);
+        assert_eq!(config.verification.max_concurrent_jobs, 2);
+        assert_eq!(config.verification.job_timeout, Duration::from_secs(30));
+        assert_eq!(config.verification.max_retries, 2);
+        assert_eq!(
+            config.verification.retry_backoff,
+            Duration::from_millis(250)
+        );
     }
 
     #[test]
@@ -466,5 +538,32 @@ mod tests {
             Config::from_file(file.path()),
             Err(Error::InvalidConfig(_))
         ));
+    }
+
+    #[test]
+    fn rejects_invalid_verification_limits() {
+        for verification in [
+            "max_concurrent_jobs = 0",
+            "max_concurrent_jobs = 257",
+            "job_timeout_secs = 0",
+            "max_retries = 11",
+            "max_retries = 1\nretry_backoff_millis = 0",
+        ] {
+            let file = config_file(&format!(
+                r#"
+                    [runtime]
+                    control_socket = "/tmp/control.sock"
+                    shutdown_timeout_secs = 10
+
+                    [verification]
+                    {verification}
+                "#,
+            ));
+
+            assert!(matches!(
+                Config::from_file(file.path()),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
     }
 }

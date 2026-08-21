@@ -17,12 +17,13 @@ Implemented:
 - Chain-owned verification service and `ProofType` proto code generation
 - Store lifecycle aligned with `QUEUED`, `VERIFYING`, `COMPLETED`, and `FAILED`
 - Tested request/response mapping for the chain verification service contract
+- Event-driven verification worker with configurable bounded concurrency and retries
 - A pinned Noir/Barretenberg 5.2.0 compatibility fixture
 
 Not yet implemented:
 
 - Running gRPC servers
-- Verification workers and the production Noir backend
+- The production Noir backend
 - Pulsar block/event listener and restart reconciliation
 - Consumer submission RPC and Cosmos transaction relay
 - Automatic P2P retrieval after an on-chain observation
@@ -101,6 +102,13 @@ Either can arrive first. Verification becomes `Queued` only when both are presen
 and `begin_verification` provides a single-flight `Queued -> Verifying` claim.
 Only `Completed` records start the default 15-minute retention period; failed jobs
 remain available for explicit retry policy.
+
+The verification worker subscribes before taking a ready-record snapshot, claims
+each ID through the Store's single-flight transition, and runs at most two jobs by
+default. Timeout and backend failures remain operational `FAILED` states and never
+become cryptographic `INVALID` verdicts. The current production registry is empty;
+the deterministic fake verifier exists only in tests until the Noir backend is
+implemented.
 
 The development defaults bound the cache to 512 MiB and each encoded composite
 proof to 8 MiB. Capacity eviction may remove non-terminal records to preserve the

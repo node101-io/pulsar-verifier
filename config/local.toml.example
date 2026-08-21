@@ -8,6 +8,12 @@ max_proof_bytes = 8388608
 terminal_retention_secs = 900
 event_buffer = 256
 
+[verification]
+max_concurrent_jobs = 2
+job_timeout_secs = 30
+max_retries = 2
+retry_backoff_millis = 250
+
 [p2p]
 enabled = true
 chain_id = "pulsar-local-1"

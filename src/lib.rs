@@ -9,6 +9,7 @@ mod error;
 mod p2p;
 mod rpc;
 mod telemetry;
+mod verification;
 
 use app::App;
 use cli::{Cli, Command};

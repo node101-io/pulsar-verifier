@@ -112,6 +112,9 @@ pub enum Error {
     #[error("invalid verification failure: {0}")]
     InvalidVerificationFailure(String),
 
+    #[error("a verifier is already registered for {0:?}")]
+    DuplicateVerifier(crate::proof::ProofType),
+
     #[error("invalid verification service request: {0}")]
     InvalidVerificationRequest(String),
 }
