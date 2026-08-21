@@ -303,15 +303,14 @@ impl ProofStore {
         let CompResult::ReplacedWith(entry) = result else {
             return Ok(None);
         };
-        let proof =
-            entry
-                .value()
-                .proof
-                .clone()
-                .ok_or_else(|| Error::InvalidVerificationTransition {
-                    verification_id,
-                    reason: "claimed record has no proof".to_owned(),
-                })?;
+        let claim = Arc::clone(entry.value());
+        let proof = claim
+            .proof
+            .clone()
+            .ok_or_else(|| Error::InvalidVerificationTransition {
+                verification_id,
+                reason: "claimed record has no proof".to_owned(),
+            })?;
         self.publish(ProofStoreEvent::VerificationChanged {
             verification_id,
             state: VerificationState::Verifying,
@@ -319,6 +318,7 @@ impl ProofStore {
         Ok(Some(VerificationJob {
             verification_id,
             proof,
+            claim,
         }))
     }
 
@@ -326,12 +326,15 @@ impl ProofStore {
     ///
     /// # Errors
     ///
-    /// Returns an error unless the record is `Verifying` or already has the same outcome.
+    /// Returns an error when the claimed record has an invalid verification state. A stale claim
+    /// whose record was evicted or replaced is ignored as an unchanged transition.
     pub async fn finish_verification(
         &self,
-        verification_id: VerificationId,
+        job: &VerificationJob,
         outcome: VerificationOutcome,
     ) -> Result<StoreChange> {
+        let verification_id = job.verification_id;
+        let claim = Arc::clone(&job.claim);
         let next = match outcome {
             VerificationOutcome::Completed(verdict) => VerificationState::Completed(verdict),
             VerificationOutcome::Failed(failure) => VerificationState::Failed(failure),
@@ -342,12 +345,11 @@ impl ProofStore {
             .records
             .entry(verification_id)
             .and_try_compute_with(move |entry| async move {
-                let entry = entry.ok_or_else(|| Error::InvalidVerificationTransition {
-                    verification_id,
-                    reason: "record does not exist".to_owned(),
-                })?;
+                let Some(entry) = entry else {
+                    return Ok::<_, Error>(Op::Nop);
+                };
                 let current = entry.value();
-                if current.metadata.verification.as_ref() == Some(&committed) {
+                if !Arc::ptr_eq(current, &claim) {
                     return Ok::<_, Error>(Op::Nop);
                 }
                 if current.metadata.verification != Some(VerificationState::Verifying) {
@@ -758,21 +760,24 @@ mod tests {
             store.begin_verification(verified),
             store.begin_verification(verified)
         );
+        let first = first.unwrap();
+        let second = second.unwrap();
         assert_eq!(
-            usize::from(first.unwrap().is_some()) + usize::from(second.unwrap().is_some()),
+            usize::from(first.is_some()) + usize::from(second.is_some()),
             1
         );
+        let verified_job = first.or(second).unwrap();
         store
             .finish_verification(
-                verified,
+                &verified_job,
                 VerificationOutcome::Completed(VerificationVerdict::Valid),
             )
             .await
             .unwrap();
-        store.begin_verification(wrong).await.unwrap().unwrap();
+        let wrong_job = store.begin_verification(wrong).await.unwrap().unwrap();
         store
             .finish_verification(
-                wrong,
+                &wrong_job,
                 VerificationOutcome::Completed(VerificationVerdict::Invalid),
             )
             .await
@@ -811,14 +816,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn stale_job_cannot_complete_a_reinserted_record() {
+        let store = ProofStore::new(config()).unwrap();
+        let candidate = proof(Bytes::from_static(b"reinserted"));
+        let id = candidate.verification_id();
+        store.observe_chain_verification(id).await.unwrap();
+        store
+            .insert_local_proof(candidate.clone(), ProofSource::Rpc)
+            .await
+            .unwrap();
+        let stale_job = store.begin_verification(id).await.unwrap().unwrap();
+
+        store.invalidate(id).await;
+        store.run_pending_tasks().await;
+        store.observe_chain_verification(id).await.unwrap();
+        store
+            .insert_local_proof(candidate, ProofSource::Rpc)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            store
+                .finish_verification(
+                    &stale_job,
+                    VerificationOutcome::Completed(VerificationVerdict::Valid),
+                )
+                .await
+                .unwrap(),
+            StoreChange::Unchanged
+        );
+        assert_eq!(
+            store.statuses(&[id]).await[0].status,
+            VerificationStatus::Queued
+        );
+    }
+
+    #[tokio::test]
     async fn operational_failure_is_distinct_and_only_retryable_failure_requeues() {
         let store = ProofStore::new(config()).unwrap();
         let retryable = stored_chain_proof(&store, b"retryable").await;
-        store.begin_verification(retryable).await.unwrap().unwrap();
+        let retryable_job = store.begin_verification(retryable).await.unwrap().unwrap();
         let failure = VerificationFailure::new("backend_timeout", "timed out", true).unwrap();
         assert_eq!(
             store
-                .finish_verification(retryable, VerificationOutcome::Failed(failure.clone()),)
+                .finish_verification(&retryable_job, VerificationOutcome::Failed(failure.clone()),)
                 .await
                 .unwrap(),
             StoreChange::Updated
@@ -834,7 +875,7 @@ mod tests {
         );
         assert_eq!(
             store
-                .finish_verification(retryable, VerificationOutcome::Failed(failure.clone()),)
+                .finish_verification(&retryable_job, VerificationOutcome::Failed(failure.clone()),)
                 .await
                 .unwrap(),
             StoreChange::Unchanged
@@ -849,10 +890,10 @@ mod tests {
         );
 
         let permanent = stored_chain_proof(&store, b"permanent").await;
-        store.begin_verification(permanent).await.unwrap().unwrap();
+        let permanent_job = store.begin_verification(permanent).await.unwrap().unwrap();
         store
             .finish_verification(
-                permanent,
+                &permanent_job,
                 VerificationOutcome::Failed(
                     VerificationFailure::new("unsupported_backend", "not configured", false)
                         .unwrap(),
@@ -872,10 +913,10 @@ mod tests {
         config.terminal_retention = Duration::from_millis(50);
         let store = ProofStore::new(config).unwrap();
         let id = stored_chain_proof(&store, b"failed-retention").await;
-        store.begin_verification(id).await.unwrap().unwrap();
+        let job = store.begin_verification(id).await.unwrap().unwrap();
         store
             .finish_verification(
-                id,
+                &job,
                 VerificationOutcome::Failed(
                     VerificationFailure::new("backend_crash", "worker exited", true).unwrap(),
                 ),
@@ -915,10 +956,10 @@ mod tests {
         let store = ProofStore::new(config).unwrap();
         let mut events = store.subscribe();
         let id = stored_chain_proof(&store, b"expiring").await;
-        store.begin_verification(id).await.unwrap().unwrap();
+        let job = store.begin_verification(id).await.unwrap().unwrap();
         store
             .finish_verification(
-                id,
+                &job,
                 VerificationOutcome::Completed(VerificationVerdict::Valid),
             )
             .await

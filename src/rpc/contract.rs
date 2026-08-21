@@ -114,7 +114,10 @@ mod tests {
     use crate::{
         config::ProofStoreConfig,
         proof::{Proof, ProofType},
-        store::{ProofSource, VerificationFailure, VerificationOutcome, VerificationVerdict},
+        store::{
+            ProofSource, VerificationFailure, VerificationJob, VerificationOutcome,
+            VerificationVerdict,
+        },
     };
 
     const MAX_STATUS_RESPONSE_BYTES: usize = 256 * 1024;
@@ -138,33 +141,33 @@ mod tests {
         }
     }
 
-    async fn ready(store: &ProofStore, proof: Proof) -> VerificationId {
+    async fn ready(store: &ProofStore, proof: Proof) -> (VerificationId, VerificationJob) {
         let id = proof.verification_id();
         store.observe_chain_verification(id).await.unwrap();
         store
             .insert_local_proof(proof, ProofSource::Rpc)
             .await
             .unwrap();
-        store.begin_verification(id).await.unwrap().unwrap();
-        id
+        let job = store.begin_verification(id).await.unwrap().unwrap();
+        (id, job)
     }
 
     #[tokio::test]
     async fn results_include_only_completed_verdicts() {
         let store = store();
-        let valid = ready(&store, proof(1)).await;
-        let failed = ready(&store, proof(2)).await;
+        let (valid, valid_job) = ready(&store, proof(1)).await;
+        let (failed, failed_job) = ready(&store, proof(2)).await;
         let missing = proof(3).verification_id();
         store
             .finish_verification(
-                valid,
+                &valid_job,
                 VerificationOutcome::Completed(VerificationVerdict::Valid),
             )
             .await
             .unwrap();
         store
             .finish_verification(
-                failed,
+                &failed_job,
                 VerificationOutcome::Failed(
                     VerificationFailure::new("backend_timeout", "timed out", true).unwrap(),
                 ),
@@ -193,7 +196,7 @@ mod tests {
     #[tokio::test]
     async fn statuses_cover_every_requested_id_and_preserve_phase_invariants() {
         let store = store();
-        let failed = ready(&store, proof(4)).await;
+        let (failed, failed_job) = ready(&store, proof(4)).await;
         let unavailable = proof(5).verification_id();
         let queued_proof = proof(6);
         let queued = queued_proof.verification_id();
@@ -202,18 +205,18 @@ mod tests {
             .insert_local_proof(queued_proof, ProofSource::Rpc)
             .await
             .unwrap();
-        let verifying = ready(&store, proof(7)).await;
-        let completed = ready(&store, proof(8)).await;
+        let (verifying, _verifying_job) = ready(&store, proof(7)).await;
+        let (completed, completed_job) = ready(&store, proof(8)).await;
         store
             .finish_verification(
-                completed,
+                &completed_job,
                 VerificationOutcome::Completed(VerificationVerdict::Invalid),
             )
             .await
             .unwrap();
         store
             .finish_verification(
-                failed,
+                &failed_job,
                 VerificationOutcome::Failed(
                     VerificationFailure::new("backend_crash", "worker exited", false).unwrap(),
                 ),

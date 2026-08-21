@@ -202,9 +202,9 @@ mod tests {
             .insert_local_proof(proof, ProofSource::Rpc)
             .await
             .unwrap();
-        store.begin_verification(id).await.unwrap().unwrap();
+        let job = store.begin_verification(id).await.unwrap().unwrap();
         store
-            .finish_verification(id, VerificationOutcome::Completed(verdict))
+            .finish_verification(&job, VerificationOutcome::Completed(verdict))
             .await
             .unwrap();
         id

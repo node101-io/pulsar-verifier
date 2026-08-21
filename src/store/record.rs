@@ -113,6 +113,27 @@ pub struct StoredProof {
 pub struct VerificationJob {
     pub verification_id: VerificationId,
     pub proof: Proof,
+    pub(crate) claim: Arc<ProofRecord>,
+}
+
+#[cfg(test)]
+impl VerificationJob {
+    pub(crate) fn detached(verification_id: VerificationId, proof: Proof) -> Self {
+        Self {
+            verification_id,
+            proof: proof.clone(),
+            claim: Arc::new(ProofRecord {
+                metadata: ProofMetadata {
+                    chain_observed_at: None,
+                    content_source: None,
+                    content_stored_at: None,
+                    verification: Some(VerificationState::Verifying),
+                    completed_at: None,
+                },
+                proof: Some(proof),
+            }),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]

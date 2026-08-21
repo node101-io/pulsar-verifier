@@ -29,11 +29,12 @@ pub(crate) struct VerificationWorker {
     config: VerificationConfig,
     pending: VecDeque<VerificationId>,
     pending_ids: HashSet<VerificationId>,
+    active_ids: HashSet<VerificationId>,
     jobs: JoinSet<JobCompletion>,
 }
 
 struct JobCompletion {
-    verification_id: VerificationId,
+    job: VerificationJob,
     outcome: VerificationOutcome,
 }
 
@@ -51,6 +52,7 @@ impl VerificationWorker {
             config,
             pending: VecDeque::new(),
             pending_ids: HashSet::new(),
+            active_ids: HashSet::new(),
             jobs: JoinSet::new(),
         }
     }
@@ -59,8 +61,12 @@ impl VerificationWorker {
         self.reconcile_ready_records();
 
         loop {
-            self.start_ready_jobs().await?;
+            if stop.is_cancelled() {
+                break;
+            }
+            self.start_ready_jobs(&stop).await?;
             tokio::select! {
+                biased;
                 () = stop.cancelled() => break,
                 event = self.store_events.recv() => self.handle_store_result(&event)?,
                 completion = self.jobs.join_next(), if !self.jobs.is_empty() => {
@@ -78,17 +84,24 @@ impl VerificationWorker {
         Ok(())
     }
 
-    async fn start_ready_jobs(&mut self) -> Result<()> {
+    async fn start_ready_jobs(&mut self, stop: &CancellationToken) -> Result<()> {
         while self.jobs.len() < self.config.max_concurrent_jobs {
+            if stop.is_cancelled() {
+                break;
+            }
             let Some(verification_id) = self.pending.pop_front() else {
                 break;
             };
             self.pending_ids.remove(&verification_id);
+            if self.active_ids.contains(&verification_id) {
+                continue;
+            }
             let Some(job) = self.store.begin_verification(verification_id).await? else {
                 continue;
             };
             let verifier = self.registry.get(job.proof.proof_type);
             let config = self.config;
+            self.active_ids.insert(verification_id);
             self.jobs
                 .spawn(async move { execute_job(job, verifier, config).await });
         }
@@ -96,13 +109,23 @@ impl VerificationWorker {
     }
 
     async fn commit_completion(
-        &self,
+        &mut self,
         completion: std::result::Result<JobCompletion, tokio::task::JoinError>,
     ) -> Result<()> {
         let completion = completion.map_err(Error::Task)?;
+        let verification_id = completion.job.verification_id;
+        self.active_ids.remove(&verification_id);
         self.store
-            .finish_verification(completion.verification_id, completion.outcome)
+            .finish_verification(&completion.job, completion.outcome)
             .await?;
+        if self
+            .store
+            .get(verification_id)
+            .await
+            .is_some_and(|record| record.metadata.verification == Some(VerificationState::Queued))
+        {
+            self.enqueue(verification_id);
+        }
         Ok(())
     }
 
@@ -115,6 +138,9 @@ impl VerificationWorker {
                 verification_id,
                 state: VerificationState::Queued,
             }) => self.enqueue(*verification_id),
+            Ok(ProofStoreEvent::ProofEvicted {
+                verification_id, ..
+            }) => self.remove_pending(*verification_id),
             Ok(_) => {}
             Err(broadcast::error::RecvError::Lagged(skipped)) => {
                 tracing::warn!(
@@ -133,14 +159,22 @@ impl VerificationWorker {
     }
 
     fn reconcile_ready_records(&mut self) {
+        self.pending.clear();
+        self.pending_ids.clear();
         for proof in self.store.records_ready_for_verification() {
             self.enqueue(proof.verification_id);
         }
     }
 
     fn enqueue(&mut self, verification_id: VerificationId) {
-        if self.pending_ids.insert(verification_id) {
+        if !self.active_ids.contains(&verification_id) && self.pending_ids.insert(verification_id) {
             self.pending.push_back(verification_id);
+        }
+    }
+
+    fn remove_pending(&mut self, verification_id: VerificationId) {
+        if self.pending_ids.remove(&verification_id) {
+            self.pending.retain(|pending| *pending != verification_id);
         }
     }
 }
@@ -154,7 +188,7 @@ async fn execute_job(
     let proof_type = job.proof.proof_type;
     let Some(verifier) = verifier else {
         return JobCompletion {
-            verification_id,
+            job,
             outcome: VerificationOutcome::Failed(failure(
                 "unsupported_proof_type",
                 "no verifier backend is registered for this proof type",
@@ -193,10 +227,7 @@ async fn execute_job(
 
         let retryable = matches!(&outcome, VerificationOutcome::Failed(error) if error.retryable());
         if !retryable || attempt == config.max_retries {
-            return JobCompletion {
-                verification_id,
-                outcome,
-            };
+            return JobCompletion { job, outcome };
         }
 
         let multiplier = 1_u32 << attempt;
@@ -436,10 +467,8 @@ mod tests {
         let verifier = Arc::new(FlakyVerifier {
             calls: AtomicUsize::new(0),
         });
-        let job = VerificationJob {
-            verification_id: proof(3).verification_id(),
-            proof: proof(3),
-        };
+        let proof = proof(3);
+        let job = VerificationJob::detached(proof.verification_id(), proof);
         let task = tokio::spawn(execute_job(
             job,
             Some(Arc::clone(&verifier) as Arc<dyn Verifier>),
@@ -475,10 +504,8 @@ mod tests {
         let verifier = Arc::new(AlwaysFailVerifier {
             calls: AtomicUsize::new(0),
         });
-        let job = VerificationJob {
-            verification_id: proof(8).verification_id(),
-            proof: proof(8),
-        };
+        let proof = proof(8);
+        let job = VerificationJob::detached(proof.verification_id(), proof);
         let completion = execute_job(
             job,
             Some(Arc::clone(&verifier) as Arc<dyn Verifier>),
@@ -516,10 +543,7 @@ mod tests {
         });
         let proof = proof(9);
         let completion = execute_job(
-            VerificationJob {
-                verification_id: proof.verification_id(),
-                proof,
-            },
+            VerificationJob::detached(proof.verification_id(), proof),
             Some(Arc::clone(&verifier) as Arc<dyn Verifier>),
             VerificationConfig {
                 max_concurrent_jobs: 1,
@@ -554,10 +578,7 @@ mod tests {
     async fn catches_backend_panic_as_non_retryable_failure() {
         let proof = proof(4);
         let completion = execute_job(
-            VerificationJob {
-                verification_id: proof.verification_id(),
-                proof,
-            },
+            VerificationJob::detached(proof.verification_id(), proof),
             Some(Arc::new(PanicVerifier)),
             config(1),
         )
@@ -617,6 +638,82 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[tokio::test]
+    async fn eviction_and_reinsertion_do_not_run_the_same_id_concurrently() {
+        let store = store(32);
+        let verifier = Arc::new(TrackingVerifier::new());
+        let registry = VerifierRegistry::new([(
+            ProofType::NoirBarretenberg,
+            Arc::clone(&verifier) as Arc<dyn Verifier>,
+        )])
+        .unwrap();
+        let candidate = proof(42);
+        let id = insert_ready(&store, candidate.clone()).await;
+        let worker = VerificationWorker::new(Arc::clone(&store), registry, config(2));
+        let stop = CancellationToken::new();
+        let task = tokio::spawn(worker.run(stop.clone()));
+
+        timeout(std::time::Duration::from_secs(2), async {
+            while verifier.calls.load(Ordering::SeqCst) != 1 {
+                verifier.started.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+
+        store.invalidate(id).await;
+        store.run_pending_tasks().await;
+        store.observe_chain_verification(id).await.unwrap();
+        store
+            .insert_local_proof(candidate, ProofSource::Rpc)
+            .await
+            .unwrap();
+        tokio::task::yield_now().await;
+        assert_eq!(verifier.calls.load(Ordering::SeqCst), 1);
+
+        verifier.release.add_permits(1);
+        timeout(std::time::Duration::from_secs(2), async {
+            while verifier.calls.load(Ordering::SeqCst) != 2 {
+                verifier.started.notified().await;
+            }
+        })
+        .await
+        .unwrap();
+        verifier.release.add_permits(1);
+        wait_for_status(
+            &store,
+            id,
+            VerificationStatus::Completed(VerificationVerdict::Valid),
+        )
+        .await;
+
+        stop.cancel();
+        task.await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn eviction_removes_pending_work_and_reconciliation_rebuilds_the_queue() {
+        let store = store(16);
+        let mut worker =
+            VerificationWorker::new(Arc::clone(&store), VerifierRegistry::default(), config(1));
+        let stale = proof(50).verification_id();
+        worker.enqueue(stale);
+        worker
+            .handle_store_result(&Ok(ProofStoreEvent::ProofEvicted {
+                verification_id: stale,
+                cause: crate::store::ProofEvictionCause::Size,
+            }))
+            .unwrap();
+        assert!(worker.pending.is_empty());
+        assert!(worker.pending_ids.is_empty());
+
+        worker.enqueue(stale);
+        let ready = insert_ready(&store, proof(51)).await;
+        worker.reconcile_ready_records();
+        assert_eq!(worker.pending.into_iter().collect::<Vec<_>>(), vec![ready]);
+        assert_eq!(worker.pending_ids, HashSet::from([ready]));
     }
 
     async fn wait_for_status(store: &ProofStore, id: VerificationId, expected: VerificationStatus) {
