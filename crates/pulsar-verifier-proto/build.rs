@@ -12,6 +12,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         proto_root.join("pulsar/verifier/v1/availability.proto"),
         proto_root.join("pulsar/verifier/v1/exchange.proto"),
         proto_root.join("pulsar/verifier/v1/verification_service.proto"),
+        proto_root.join("pulsar/verifier/v1/submission_service.proto"),
     ];
     let protoc = protoc_bin_vendored::protoc_bin_path()?;
     let protoc_include = protoc_bin_vendored::include_path()?;
@@ -41,6 +42,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=proto/pulsar/verifier/v1/availability.proto");
     println!("cargo:rerun-if-changed=proto/pulsar/verifier/v1/exchange.proto");
     println!("cargo:rerun-if-changed=proto/pulsar/verifier/v1/verification_service.proto");
+    println!("cargo:rerun-if-changed=proto/pulsar/verifier/v1/submission_service.proto");
     println!("cargo:rerun-if-changed=proto/amino/amino.proto");
     println!("cargo:rerun-if-changed=proto/gogoproto/gogo.proto");
     Ok(())

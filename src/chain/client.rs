@@ -28,7 +28,6 @@ pub(crate) struct ChainStatus {
 
 /// Immediate `CheckTx` receipt returned by `CometBFT`'s synchronous broadcast.
 #[derive(Clone, Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub(crate) struct BroadcastReceipt {
     pub(crate) transaction_hash: [u8; 32],
     pub(crate) code: u32,
@@ -153,7 +152,6 @@ impl PulsarClient {
     }
 
     /// Relays an already signed Cosmos transaction and returns its `CheckTx` result.
-    #[allow(dead_code)]
     pub(crate) async fn broadcast_tx_sync(&self, tx_raw: Bytes) -> Result<BroadcastReceipt> {
         let response = self
             .with_timeout(
@@ -471,7 +469,6 @@ fn chain_error(error: impl fmt::Display) -> Error {
     Error::Chain(error.to_string())
 }
 
-#[allow(dead_code)]
 fn bounded_text(mut value: String, max_bytes: usize) -> String {
     if value.len() <= max_bytes {
         return value;

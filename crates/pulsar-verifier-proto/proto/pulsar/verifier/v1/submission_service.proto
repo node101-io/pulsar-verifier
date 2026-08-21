@@ -1,0 +1,22 @@
+syntax = "proto3";
+
+package pulsar.verifier.v1;
+
+import "pulsar/verifier/v1/proof.proto";
+
+// SubmissionService accepts proof content and relays its pre-signed chain transaction.
+service SubmissionService {
+  // SubmitProof returns after the local CometBFT node accepts the transaction in CheckTx.
+  rpc SubmitProof(SubmitProofRequest) returns (SubmitProofResponse);
+}
+
+message SubmitProofRequest {
+  Proof proof = 1;
+  bytes tx_raw = 2;
+}
+
+// Success means pending chain inclusion, not a committed verification request.
+message SubmitProofResponse {
+  bytes verification_id = 1;
+  bytes transaction_hash = 2;
+}

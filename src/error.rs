@@ -150,13 +150,13 @@ pub enum Error {
     #[error("invalid verification service request: {0}")]
     InvalidVerificationRequest(String),
 
-    #[error("failed to bind verification RPC server on {address}: {source}")]
+    #[error("failed to bind RPC server on {address}: {source}")]
     RpcBind {
         address: SocketAddr,
         #[source]
         source: io::Error,
     },
 
-    #[error("verification RPC server failed: {0}")]
+    #[error("RPC server failed: {0}")]
     RpcServer(#[source] tonic::transport::Error),
 }

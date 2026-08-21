@@ -141,4 +141,22 @@ mod tests {
 
         assert_eq!(request.verification_ids.len(), 1);
     }
+
+    #[test]
+    fn submission_round_trip_preserves_proof_and_transaction() {
+        let request = super::v1::SubmitProofRequest {
+            proof: Some(Proof {
+                proof_type: ProofType::NoirBarretenberg.into(),
+                proof: vec![1; 64],
+                public_inputs: vec![2; 32],
+                verification_key: vec![3; 128],
+            }),
+            tx_raw: vec![4; 256],
+        };
+
+        assert_eq!(
+            super::v1::SubmitProofRequest::decode(request.encode_to_vec().as_slice()).unwrap(),
+            request
+        );
+    }
 }

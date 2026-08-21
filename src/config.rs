@@ -21,6 +21,7 @@ pub struct Config {
     pub p2p: P2pConfig,
     pub verification: VerificationConfig,
     pub rpc: RpcConfig,
+    pub submission: SubmissionConfig,
 }
 
 /// Shared Pulsar chain identity and local `CometBFT` RPC settings.
@@ -52,6 +53,27 @@ impl RpcConfig {
         Self {
             enabled: false,
             listen_address: "127.0.0.1:50051".parse().expect("valid test address"),
+        }
+    }
+}
+
+/// Loopback-only consumer proof ingress and resource limits.
+#[derive(Debug, Clone, Copy)]
+pub struct SubmissionConfig {
+    pub enabled: bool,
+    pub listen_address: SocketAddr,
+    pub max_transaction_bytes: usize,
+    pub max_concurrent_requests: usize,
+}
+
+impl SubmissionConfig {
+    #[cfg(test)]
+    pub(crate) fn disabled() -> Self {
+        Self {
+            enabled: false,
+            listen_address: "127.0.0.1:50052".parse().expect("valid test address"),
+            max_transaction_bytes: 1024 * 1024,
+            max_concurrent_requests: 16,
         }
     }
 }
@@ -128,6 +150,8 @@ struct FileConfig {
     verification: FileVerificationConfig,
     #[serde(default)]
     rpc: FileRpcConfig,
+    #[serde(default)]
+    submission: FileSubmissionConfig,
 }
 
 #[derive(Debug, Deserialize)]
@@ -178,6 +202,26 @@ impl Default for FileRpcConfig {
         Self {
             enabled: false,
             listen_address: "127.0.0.1:50051".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileSubmissionConfig {
+    enabled: bool,
+    listen_address: String,
+    max_transaction_bytes: usize,
+    max_concurrent_requests: usize,
+}
+
+impl Default for FileSubmissionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_address: "127.0.0.1:50052".to_owned(),
+            max_transaction_bytes: 1024 * 1024,
+            max_concurrent_requests: 16,
         }
     }
 }
@@ -292,7 +336,11 @@ impl Config {
         };
         let proof_store = validate_proof_store(file.proof_store)?;
         let listener = validate_listener(file.listener)?;
-        let chain = validate_chain(file.chain, file.p2p.enabled || listener.enabled)?;
+        let submission = validate_submission(&file.submission)?;
+        let chain = validate_chain(
+            file.chain,
+            file.p2p.enabled || listener.enabled || submission.enabled,
+        )?;
         let p2p = validate_p2p(
             file.p2p,
             proof_store.max_proof_bytes,
@@ -311,6 +359,21 @@ impl Config {
                 "listener.enabled must be true when P2P is enabled".to_owned(),
             ));
         }
+        if submission.enabled && !listener.enabled {
+            return Err(Error::InvalidConfig(
+                "listener.enabled must be true when submission is enabled".to_owned(),
+            ));
+        }
+        if submission.enabled && !rpc.enabled {
+            return Err(Error::InvalidConfig(
+                "rpc.enabled must be true when submission is enabled".to_owned(),
+            ));
+        }
+        if submission.enabled && rpc.enabled && submission.listen_address == rpc.listen_address {
+            return Err(Error::InvalidConfig(
+                "submission.listen_address must differ from rpc.listen_address".to_owned(),
+            ));
+        }
 
         Ok(Self {
             runtime,
@@ -320,6 +383,7 @@ impl Config {
             p2p,
             verification,
             rpc,
+            submission,
         })
     }
 }
@@ -328,7 +392,8 @@ fn validate_chain(file: FileChainConfig, required: bool) -> Result<ChainConfig> 
     let chain_id = file.chain_id.trim();
     if required && chain_id.is_empty() {
         return Err(Error::InvalidConfig(
-            "chain.chain_id must not be empty when Listener or P2P is enabled".to_owned(),
+            "chain.chain_id must not be empty when Listener, P2P, or submission is enabled"
+                .to_owned(),
         ));
     }
     if !file.comet_rpc_url.starts_with("http://") && !file.comet_rpc_url.starts_with("https://") {
@@ -373,25 +438,51 @@ fn validate_listener(file: FileListenerConfig) -> Result<ListenerConfig> {
 }
 
 fn validate_rpc(file: &FileRpcConfig) -> Result<RpcConfig> {
-    let listen_address = file.listen_address.parse::<SocketAddr>().map_err(|error| {
-        Error::InvalidConfig(format!(
-            "rpc.listen_address must be a literal IP and port: {error}"
-        ))
-    })?;
-    if file.enabled && listen_address.port() == 0 {
-        return Err(Error::InvalidConfig(
-            "rpc.listen_address port must be greater than zero when RPC is enabled".to_owned(),
-        ));
-    }
-    if file.enabled && !listen_address.ip().is_loopback() {
-        return Err(Error::InvalidConfig(
-            "rpc.listen_address must use a loopback IP when RPC is enabled".to_owned(),
-        ));
-    }
+    let listen_address = validate_loopback_address("rpc", file.enabled, &file.listen_address)?;
     Ok(RpcConfig {
         enabled: file.enabled,
         listen_address,
     })
+}
+
+fn validate_submission(file: &FileSubmissionConfig) -> Result<SubmissionConfig> {
+    let listen_address =
+        validate_loopback_address("submission", file.enabled, &file.listen_address)?;
+    if !(1..=16 * 1024 * 1024).contains(&file.max_transaction_bytes) {
+        return Err(Error::InvalidConfig(
+            "submission.max_transaction_bytes must be between 1 byte and 16 MiB".to_owned(),
+        ));
+    }
+    if !(1..=64).contains(&file.max_concurrent_requests) {
+        return Err(Error::InvalidConfig(
+            "submission.max_concurrent_requests must be between 1 and 64".to_owned(),
+        ));
+    }
+    Ok(SubmissionConfig {
+        enabled: file.enabled,
+        listen_address,
+        max_transaction_bytes: file.max_transaction_bytes,
+        max_concurrent_requests: file.max_concurrent_requests,
+    })
+}
+
+fn validate_loopback_address(section: &str, enabled: bool, value: &str) -> Result<SocketAddr> {
+    let address = value.parse::<SocketAddr>().map_err(|error| {
+        Error::InvalidConfig(format!(
+            "{section}.listen_address must be a literal IP and port: {error}"
+        ))
+    })?;
+    if enabled && address.port() == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "{section}.listen_address port must be greater than zero when enabled"
+        )));
+    }
+    if enabled && !address.ip().is_loopback() {
+        return Err(Error::InvalidConfig(format!(
+            "{section}.listen_address must use a loopback IP when enabled"
+        )));
+    }
+    Ok(address)
 }
 
 fn validate_verification(file: FileVerificationConfig) -> Result<VerificationConfig> {
@@ -558,6 +649,13 @@ mod tests {
             config.rpc.listen_address,
             "127.0.0.1:50051".parse().unwrap()
         );
+        assert!(!config.submission.enabled);
+        assert_eq!(
+            config.submission.listen_address,
+            "127.0.0.1:50052".parse().unwrap()
+        );
+        assert_eq!(config.submission.max_transaction_bytes, 1024 * 1024);
+        assert_eq!(config.submission.max_concurrent_requests, 16);
     }
 
     #[test]
@@ -850,6 +948,126 @@ mod tests {
                 "#,
             ));
 
+            assert!(matches!(
+                Config::from_file(file.path()),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn loads_enabled_submission_with_required_services() {
+        let file = config_file(
+            r#"
+                [runtime]
+                control_socket = "/tmp/control.sock"
+                shutdown_timeout_secs = 15
+
+                [chain]
+                chain_id = "pulsar-test"
+
+                [listener]
+                enabled = true
+
+                [rpc]
+                enabled = true
+                listen_address = "127.0.0.1:50051"
+
+                [submission]
+                enabled = true
+                listen_address = "127.0.0.1:50052"
+                max_transaction_bytes = 2048
+                max_concurrent_requests = 4
+            "#,
+        );
+
+        let config = Config::from_file(file.path()).unwrap();
+
+        assert!(config.submission.enabled);
+        assert_eq!(config.submission.max_transaction_bytes, 2048);
+        assert_eq!(config.submission.max_concurrent_requests, 4);
+    }
+
+    #[test]
+    fn rejects_unsafe_or_incomplete_submission_config() {
+        for extra in [
+            "",
+            "[chain]\nchain_id = \"pulsar-test\"",
+            "[chain]\nchain_id = \"pulsar-test\"\n[listener]\nenabled = true",
+        ] {
+            let file = config_file(&format!(
+                r#"
+                    [runtime]
+                    control_socket = "/tmp/control.sock"
+                    shutdown_timeout_secs = 15
+
+                    {extra}
+
+                    [submission]
+                    enabled = true
+                "#
+            ));
+            assert!(matches!(
+                Config::from_file(file.path()),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+
+        for address in ["0.0.0.0:50052", "10.0.0.1:50052", "127.0.0.1:0"] {
+            let file = config_file(&format!(
+                r#"
+                    [runtime]
+                    control_socket = "/tmp/control.sock"
+                    shutdown_timeout_secs = 15
+
+                    [chain]
+                    chain_id = "pulsar-test"
+
+                    [listener]
+                    enabled = true
+
+                    [rpc]
+                    enabled = true
+
+                    [submission]
+                    enabled = true
+                    listen_address = "{address}"
+                "#
+            ));
+            assert!(matches!(
+                Config::from_file(file.path()),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+
+        for settings in [
+            "listen_address = \"127.0.0.1:50051\"",
+            "max_transaction_bytes = 0",
+            "max_transaction_bytes = 16777217",
+            "max_concurrent_requests = 0",
+            "max_concurrent_requests = 65",
+        ] {
+            let file = config_file(&format!(
+                r#"
+                    [runtime]
+                    control_socket = "/tmp/control.sock"
+                    shutdown_timeout_secs = 15
+
+                    [chain]
+                    chain_id = "pulsar-test"
+
+                    [listener]
+                    enabled = true
+
+                    [rpc]
+                    enabled = true
+                    listen_address = "127.0.0.1:50051"
+
+                    [submission]
+                    enabled = true
+                    {settings}
+                "#
+            ));
             assert!(matches!(
                 Config::from_file(file.path()),
                 Err(Error::InvalidConfig(_))

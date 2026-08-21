@@ -10,8 +10,6 @@ mod error;
 mod listener;
 mod p2p;
 mod rpc;
-// This core is consumed by the submission RPC in the next stacked branch.
-#[allow(dead_code)]
 mod submission;
 mod telemetry;
 mod verification;

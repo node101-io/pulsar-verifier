@@ -21,12 +21,13 @@ Implemented:
 - Loopback-only chain-facing gRPC server with standard health reporting
 - Committed `NewBlock` listener with bounded restart and reconnect recovery
 - Validator authorization refresh driven by committed `validators_hash` changes
+- Loopback consumer submission RPC with proof-to-transaction binding validation
+- Store-first signed Cosmos transaction relay through local CometBFT `CheckTx`
 - A pinned Noir/Barretenberg 5.2.0 compatibility fixture
 
 Not yet implemented:
 
 - The production Noir backend
-- Consumer submission RPC and Cosmos transaction relay
 - Automatic P2P retrieval after an on-chain observation
 
 ## CLI
@@ -52,6 +53,31 @@ The packaged development config serves the chain-facing verification API on
 `127.0.0.1:50051`. Config files that omit `[rpc]` keep the server disabled. This
 phase intentionally accepts only literal loopback listeners because the RPC is
 plaintext and unauthenticated.
+
+Consumer submission is independently disabled by default. Enabling
+`[submission]` opens `127.0.0.1:50052`, requires the Listener and result RPC, and
+accepts a complete `Proof` plus an already signed Cosmos `TxRaw`. The sidecar
+does not construct, simulate, or sign transactions.
+
+## Consumer Submission
+
+The submission service decodes `TxRaw -> TxBody -> Any -> MsgSubmitProof` and
+requires exactly one verification-module message. It recomputes the SHA-256
+hashes of the proof, public inputs, and verification key, then checks the proof
+type and resulting `VerificationId` against the signed message before producing
+any side effect.
+
+After validation, content is written to the `ProofStore` first. The existing
+`ProofStored` event automatically produces the P2P availability announcement;
+the RPC does not maintain a second announcement path. The signed transaction is
+then relayed to the configured local CometBFT endpoint with
+`broadcast_tx_sync`.
+
+A successful response means only that `CheckTx` accepted the transaction. It is
+still pending chain inclusion, and verification cannot begin until the committed
+Listener observes the matching request. Successful relay receipts are cached in
+memory for 15 minutes so repeated identical requests do not rebroadcast the same
+transaction. The cache and all proof state are lost on restart by design.
 
 ## Pulsar Listener
 

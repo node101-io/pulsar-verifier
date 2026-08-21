@@ -18,6 +18,12 @@ retry_backoff_millis = 250
 enabled = true
 listen_address = "127.0.0.1:50051"
 
+[submission]
+enabled = false
+listen_address = "127.0.0.1:50052"
+max_transaction_bytes = 1048576
+max_concurrent_requests = 16
+
 [listener]
 enabled = false
 
