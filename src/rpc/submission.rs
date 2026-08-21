@@ -7,10 +7,19 @@ use pulsar_verifier_proto::v1::{
         SubmissionService as SubmissionRpcContract, SubmissionServiceServer,
     },
 };
-use tokio::{net::TcpListener, sync::Semaphore, task::JoinHandle, time::timeout};
+use tokio::{
+    net::TcpListener,
+    sync::{OwnedSemaphorePermit, Semaphore},
+    task::JoinHandle,
+    time::timeout,
+};
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
-use tonic::{Request, Response, Status, transport::Server};
+use tonic::{
+    Request, Response, Status,
+    service::{Interceptor, interceptor::InterceptedService},
+    transport::Server,
+};
 use tonic_health::{ServingStatus, server::HealthReporter};
 
 use crate::{
@@ -24,6 +33,7 @@ use crate::{
 const SUBMISSION_RPC_TASK: &str = "submission RPC server";
 const RESPONSE_MESSAGE_LIMIT: usize = 1_024;
 const PROTOBUF_ENVELOPE_OVERHEAD: usize = 16;
+const SUBMISSION_SERVICE_NAME: &str = "pulsar.verifier.v1.SubmissionService";
 
 /// Result of the submission task exiting outside graceful shutdown.
 pub(crate) struct SubmissionRpcExit {
@@ -73,16 +83,22 @@ impl SubmissionRpcServer {
             address: config.listen_address,
             source,
         })?;
-        let service = SubmissionRpc::new(
-            SubmissionService::new(store, chain, max_proof_bytes, config.max_transaction_bytes),
-            config.max_concurrent_requests,
-        );
+        let service = SubmissionRpc::new(SubmissionService::new(
+            store,
+            chain,
+            max_proof_bytes,
+            config.max_transaction_bytes,
+        ));
         let submission_service = SubmissionServiceServer::new(service)
             .max_decoding_message_size(request_limit)
             .max_encoding_message_size(RESPONSE_MESSAGE_LIMIT);
+        let submission_service = InterceptedService::new(
+            submission_service,
+            SubmissionAdmission::new(config.max_concurrent_requests),
+        );
         let (mut health, health_service) = tonic_health::server::health_reporter();
         health
-            .set_serving::<SubmissionServiceServer<SubmissionRpc>>()
+            .set_service_status(SUBMISSION_SERVICE_NAME, ServingStatus::Serving)
             .await;
         let stop = CancellationToken::new();
         let shutdown = stop.clone();
@@ -109,7 +125,7 @@ impl SubmissionRpcServer {
 
     pub(crate) async fn mark_not_serving(&mut self) {
         self.health
-            .set_not_serving::<SubmissionServiceServer<SubmissionRpc>>()
+            .set_service_status(SUBMISSION_SERVICE_NAME, ServingStatus::NotServing)
             .await;
         self.health
             .set_service_status("", ServingStatus::NotServing)
@@ -178,15 +194,34 @@ impl Drop for SubmissionRpcServer {
 #[derive(Clone)]
 struct SubmissionRpc {
     service: SubmissionService,
-    permits: Arc<Semaphore>,
 }
 
 impl SubmissionRpc {
-    fn new(service: SubmissionService, max_concurrent_requests: usize) -> Self {
+    fn new(service: SubmissionService) -> Self {
+        Self { service }
+    }
+}
+
+#[derive(Clone)]
+struct SubmissionAdmission {
+    permits: Arc<Semaphore>,
+}
+
+impl SubmissionAdmission {
+    fn new(max_concurrent_requests: usize) -> Self {
         Self {
-            service,
             permits: Arc::new(Semaphore::new(max_concurrent_requests)),
         }
+    }
+}
+
+impl Interceptor for SubmissionAdmission {
+    fn call(&mut self, mut request: Request<()>) -> std::result::Result<Request<()>, Status> {
+        let permit = Arc::clone(&self.permits)
+            .try_acquire_owned()
+            .map_err(|_| Status::resource_exhausted("submission concurrency limit reached"))?;
+        request.extensions_mut().insert(Arc::new(permit));
+        Ok(request)
     }
 }
 
@@ -194,11 +229,12 @@ impl SubmissionRpc {
 impl SubmissionRpcContract for SubmissionRpc {
     async fn submit_proof(
         &self,
-        request: Request<SubmitProofRequest>,
+        mut request: Request<SubmitProofRequest>,
     ) -> std::result::Result<Response<SubmitProofResponse>, Status> {
-        let _permit = Arc::clone(&self.permits)
-            .try_acquire_owned()
-            .map_err(|_| Status::resource_exhausted("submission concurrency limit reached"))?;
+        let _permit = request
+            .extensions_mut()
+            .remove::<Arc<OwnedSemaphorePermit>>()
+            .ok_or_else(|| Status::internal("submission admission permit is missing"))?;
         let request = request.into_inner();
         let proof = request
             .proof
@@ -355,37 +391,20 @@ mod tests {
         chain_task.await.unwrap();
     }
 
-    #[tokio::test]
-    async fn global_concurrency_limit_rejects_excess_work() {
-        let (url, chain_stop, chain_task) = spawn_rpc_server(Arc::new(|request| {
-            rpc_result(&request, &serde_json::json!({}))
-        }))
-        .await;
-        let service = SubmissionService::new(
-            store(),
-            PulsarClient::new(&ChainConfig {
-                chain_id: "pulsar-test-1".to_owned(),
-                comet_rpc_url: url,
-                request_timeout: Duration::from_secs(1),
-            })
-            .unwrap(),
-            1_024,
-            1_024,
+    #[test]
+    fn admission_limit_runs_before_request_decoding() {
+        let mut admission = SubmissionAdmission::new(1);
+        let accepted = admission.call(Request::new(())).unwrap();
+        assert!(
+            accepted
+                .extensions()
+                .get::<Arc<OwnedSemaphorePermit>>()
+                .is_some()
         );
-        let rpc = SubmissionRpc::new(service, 1);
-        let _permit = Arc::clone(&rpc.permits).acquire_owned().await.unwrap();
-
-        let error = rpc
-            .submit_proof(Request::new(SubmitProofRequest {
-                proof: None,
-                tx_raw: Vec::new(),
-            }))
-            .await
-            .unwrap_err();
-
+        let error = admission.call(Request::new(())).unwrap_err();
         assert_eq!(error.code(), Code::ResourceExhausted);
-        chain_stop.cancel();
-        chain_task.await.unwrap();
+        drop(accepted);
+        assert!(admission.call(Request::new(())).is_ok());
     }
 
     #[test]

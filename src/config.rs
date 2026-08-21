@@ -366,6 +366,12 @@ impl Config {
                     .to_owned(),
             ));
         }
+        if submission.enabled && runtime.shutdown_timeout <= chain.request_timeout {
+            return Err(Error::InvalidConfig(
+                "runtime.shutdown_timeout_secs must be greater than chain.request_timeout_secs when submission is enabled"
+                    .to_owned(),
+            ));
+        }
         if p2p.enabled && !listener.enabled {
             return Err(Error::InvalidConfig(
                 "listener.enabled must be true when P2P is enabled".to_owned(),
@@ -1155,5 +1161,35 @@ mod tests {
                 Err(Error::InvalidConfig(_))
             ));
         }
+    }
+
+    #[test]
+    fn submission_requires_shutdown_margin_for_chain_relay() {
+        let file = config_file(
+            r#"
+                [runtime]
+                control_socket = "/tmp/control.sock"
+                shutdown_timeout_secs = 5
+
+                [chain]
+                chain_id = "pulsar-test"
+                request_timeout_secs = 5
+
+                [listener]
+                enabled = true
+
+                [rpc]
+                enabled = true
+
+                [submission]
+                enabled = true
+            "#,
+        );
+
+        assert!(matches!(
+            Config::from_file(file.path()),
+            Err(Error::InvalidConfig(message))
+                if message.contains("chain.request_timeout_secs")
+        ));
     }
 }
