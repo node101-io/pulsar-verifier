@@ -19,14 +19,13 @@ pub(crate) struct ChainProof {
 }
 
 /// Validates one query record and returns pending requests only.
-#[allow(dead_code, reason = "used by the listener in the next stacked change")]
 pub(crate) fn validate_query_proof(
     response: QueryProofResponse,
     requested_height: u64,
 ) -> Result<Option<ChainProof>> {
-    let key = response
-        .proof_key
-        .ok_or_else(|| Error::Chain("proof query response is missing proof_key".to_owned()))?;
+    let key = response.proof_key.ok_or_else(|| {
+        Error::InvalidChainContract("proof query response is missing proof_key".to_owned())
+    })?;
     validate_position(key.submission_height, key.index_in_block, requested_height)?;
 
     let (id, pending) = match response.state {
@@ -37,7 +36,11 @@ pub(crate) fn validate_query_proof(
             validate_final_position(&record, key.submission_height, key.index_in_block)?;
             (validate_final_descriptor(&record)?, false)
         }
-        None => return Err(Error::Chain("proof query response has no state".to_owned())),
+        None => {
+            return Err(Error::InvalidChainContract(
+                "proof query response has no state".to_owned(),
+            ));
+        }
     };
 
     Ok(pending.then_some(ChainProof {
@@ -72,19 +75,18 @@ pub(crate) fn validate_descriptor(
     Ok(expected)
 }
 
-#[allow(dead_code, reason = "used by the listener in the next stacked change")]
 pub(crate) fn validate_position(
     submission_height: u64,
     index_in_block: u32,
     expected_height: u64,
 ) -> Result<()> {
     if submission_height == 0 || submission_height != expected_height {
-        return Err(Error::Chain(format!(
+        return Err(Error::InvalidChainContract(format!(
             "invalid proof submission height {submission_height}; expected {expected_height}"
         )));
     }
     if index_in_block >= MAX_PROOFS_PER_BLOCK {
-        return Err(Error::Chain(format!(
+        return Err(Error::InvalidChainContract(format!(
             "proof index {index_in_block} exceeds the per-block contract limit"
         )));
     }
@@ -117,7 +119,7 @@ fn validate_final_position(
     index_in_block: u32,
 ) -> Result<()> {
     if record.submission_height != submission_height {
-        return Err(Error::Chain(
+        return Err(Error::InvalidChainContract(
             "final proof result disagrees with its proof key height".to_owned(),
         ));
     }
@@ -128,7 +130,7 @@ fn validate_final_position(
 
 fn component_hash(name: &str, bytes: &[u8]) -> Result<[u8; COMPONENT_HASH_LEN]> {
     bytes.try_into().map_err(|_| {
-        Error::Chain(format!(
+        Error::InvalidChainContract(format!(
             "{name} must be {COMPONENT_HASH_LEN} bytes, got {}",
             bytes.len()
         ))
@@ -158,7 +160,7 @@ mod tests {
     fn rejects_malformed_or_mismatched_descriptor() {
         assert!(matches!(
             validate_descriptor(2, &[1; 31], &[2; 32], &[3; 32], &[4; 32]),
-            Err(Error::Chain(_))
+            Err(Error::InvalidChainContract(_))
         ));
         assert!(matches!(
             validate_descriptor(2, &[1; 32], &[2; 32], &[3; 32], &[4; 32]),

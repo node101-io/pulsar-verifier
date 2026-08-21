@@ -19,12 +19,13 @@ Implemented:
 - Tested request/response mapping for the chain verification service contract
 - Event-driven verification worker with configurable bounded concurrency and retries
 - Loopback-only chain-facing gRPC server with standard health reporting
+- Committed `NewBlock` listener with bounded restart and reconnect recovery
+- Validator authorization refresh driven by committed `validators_hash` changes
 - A pinned Noir/Barretenberg 5.2.0 compatibility fixture
 
 Not yet implemented:
 
 - The production Noir backend
-- Pulsar block/event listener and restart reconciliation
 - Consumer submission RPC and Cosmos transaction relay
 - Automatic P2P retrieval after an on-chain observation
 
@@ -45,12 +46,31 @@ cargo run -- stop --config config/default.toml
 Both commands default to `config/default.toml`. `run` handles `Ctrl-C`, `SIGTERM`,
 and the control socket through the same shutdown path. P2P is disabled in the
 development config; `config/local.toml.example` shows the validator credentials,
-CometBFT endpoint, and listeners required to enable it.
+`CometBFT` endpoint, chain listener, and network listeners required to enable it.
 
 The packaged development config serves the chain-facing verification API on
 `127.0.0.1:50051`. Config files that omit `[rpc]` keep the server disabled. This
 phase intentionally accepts only literal loopback listeners because the RPC is
 plaintext and unauthenticated.
+
+## Pulsar Listener
+
+The Listener subscribes only to committed `NewBlock` events. It validates every
+`verification.proof_submitted` descriptor before writing its `VerificationId` to
+the Store; mempool and `CheckTx` signals never start verification.
+
+Startup and every reconnect subscribe before querying chain state, then reconcile
+the latest committed height and the preceding two proof heights through the
+chain-owned `ProofsByHeight` query. This fixed three-height window matches the
+chain's `H+2` and `H+3` commitment opportunities, so no permanent cursor or local
+database is required. Duplicate live and recovered observations are suppressed by
+the Store's idempotent transition.
+
+The committed block header's `validators_hash` is the authorization change
+signal. When it changes, the complete validator set at that exact height is
+fetched and installed atomically in P2P. A failed fetch preserves the previous
+allow-list; removal of the local validator clears authorization and shuts the
+process down fail-closed. P2P therefore requires the Listener to be enabled.
 
 ## Verification Contract
 

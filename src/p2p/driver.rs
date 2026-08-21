@@ -661,8 +661,6 @@ impl Driver {
                 .add_explicit_peer(&added);
         }
         self.authorized_peers = peers;
-
-        // TODO: Pulsar Listener should fetch and submit a new complete set only on change events.
     }
 
     fn begin_drain(&mut self, reply: CommandReply<()>) {

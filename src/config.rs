@@ -331,6 +331,11 @@ fn validate_chain(file: FileChainConfig, required: bool) -> Result<ChainConfig> 
             "chain.chain_id must not be empty when Listener or P2P is enabled".to_owned(),
         ));
     }
+    if !file.comet_rpc_url.starts_with("http://") && !file.comet_rpc_url.starts_with("https://") {
+        return Err(Error::InvalidConfig(
+            "chain.comet_rpc_url must use http or https".to_owned(),
+        ));
+    }
     HttpClient::new(file.comet_rpc_url.as_str()).map_err(|error| {
         Error::InvalidConfig(format!("chain.comet_rpc_url is invalid: {error}"))
     })?;
@@ -690,6 +695,71 @@ mod tests {
         assert!(matches!(
             Config::from_file(file.path()),
             Err(Error::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn listener_requires_valid_chain_and_reconnect_policy() {
+        for chain_and_listener in [
+            r"
+                [listener]
+                enabled = true
+            ",
+            r#"
+                [chain]
+                chain_id = "pulsar-test"
+                comet_rpc_url = "ftp://127.0.0.1:26657"
+
+                [listener]
+                enabled = true
+            "#,
+            r#"
+                [chain]
+                chain_id = "pulsar-test"
+
+                [listener]
+                enabled = true
+                reconnect_initial_backoff_millis = 31000
+                reconnect_max_backoff_secs = 30
+            "#,
+        ] {
+            let file = config_file(&format!(
+                r#"
+                    [runtime]
+                    control_socket = "/tmp/control.sock"
+                    shutdown_timeout_secs = 10
+
+                    {chain_and_listener}
+                "#,
+            ));
+            assert!(matches!(
+                Config::from_file(file.path()),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn enabled_p2p_requires_listener() {
+        let file = config_file(
+            r#"
+                [runtime]
+                control_socket = "/tmp/control.sock"
+                shutdown_timeout_secs = 15
+
+                [chain]
+                chain_id = "pulsar-test"
+
+                [p2p]
+                enabled = true
+                listen_addresses = ["/ip4/0.0.0.0/tcp/39000"]
+                validator_key_path = "/tmp/priv_validator_key.json"
+            "#,
+        );
+
+        assert!(matches!(
+            Config::from_file(file.path()),
+            Err(Error::InvalidConfig(message)) if message.contains("listener.enabled")
         ));
     }
 

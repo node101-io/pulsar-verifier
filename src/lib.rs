@@ -7,6 +7,7 @@ mod app;
 mod chain;
 mod control;
 mod error;
+mod listener;
 mod p2p;
 mod rpc;
 mod telemetry;

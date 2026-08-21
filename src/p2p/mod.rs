@@ -11,7 +11,7 @@ mod worker;
 use authorization::ValidatorSetClient;
 use driver::{Driver, DriverClient, DriverParts};
 use identity::load_validator_identity;
-pub(crate) use service::{P2pExit, P2pService};
+pub(crate) use service::{P2pExit, P2pService, ValidatorSetUpdater};
 use types::{DriverEvent, InboundProofRequestId, ProofRequestId, QueryId};
 use worker::Worker;
 

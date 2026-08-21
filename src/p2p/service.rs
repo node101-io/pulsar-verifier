@@ -1,5 +1,6 @@
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashSet, sync::Arc, time::Duration};
 
+use libp2p::PeerId;
 use tokio::{task::JoinHandle, time::timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -36,6 +37,8 @@ impl P2pExit {
 /// Owns P2P task dependencies and their ordered graceful-shutdown protocol.
 pub(crate) struct P2pService {
     driver: Option<DriverClient>,
+    validator_set: ValidatorSetClient,
+    local_peer_id: PeerId,
     worker_stop: CancellationToken,
     driver_task: Option<JoinHandle<Result<()>>>,
     worker_task: Option<JoinHandle<Result<()>>>,
@@ -69,6 +72,8 @@ impl P2pService {
         let worker_task = tokio::spawn(worker.run(worker_stop.clone()));
         let service = Self {
             driver: Some(client),
+            validator_set: validator_client,
+            local_peer_id,
             worker_stop,
             driver_task: Some(driver_task),
             worker_task: Some(worker_task),
@@ -85,10 +90,20 @@ impl P2pService {
             return Err(error);
         }
 
-        // TODO: Pulsar Listener should reload and replace validator authorization
-        // only after observing an on-chain validator-set change event.
         tracing::info!(%local_peer_id, "validator-authorized P2P network is ready");
         Ok(service)
+    }
+
+    pub(crate) fn validator_set_updater(&self) -> ValidatorSetUpdater {
+        ValidatorSetUpdater {
+            driver: self
+                .driver
+                .as_ref()
+                .expect("driver exists while P2P service is active")
+                .clone(),
+            validator_set: self.validator_set.clone(),
+            local_peer_id: self.local_peer_id,
+        }
     }
 
     pub(crate) async fn wait_for_exit(&mut self) -> P2pExit {
@@ -128,7 +143,7 @@ impl P2pService {
     }
 
     async fn shutdown_ordered(&mut self) -> Result<()> {
-        // TODO: Stop future RPC, Listener, and verifier producers before P2P drain.
+        // TODO: Stop the future consumer submission RPC before P2P drain.
         {
             let driver = self.driver.as_ref().ok_or(Error::P2pDriverClosed)?.clone();
             tokio::select! {
@@ -182,6 +197,25 @@ impl P2pService {
             worker_running = self.worker_task.is_some(),
             "p2p shutdown timed out"
         );
+    }
+}
+
+/// Narrow capability used by the Listener to atomically refresh P2P authorization.
+#[derive(Clone)]
+pub(crate) struct ValidatorSetUpdater {
+    driver: DriverClient,
+    validator_set: ValidatorSetClient,
+    local_peer_id: PeerId,
+}
+
+impl ValidatorSetUpdater {
+    pub(crate) async fn replace_at(&self, height: u64) -> Result<()> {
+        let peers = self.validator_set.load_at(height).await?;
+        if !peers.contains(&self.local_peer_id) {
+            self.driver.replace_authorized_peers(HashSet::new()).await?;
+            return Err(Error::LocalValidatorRemoved(self.local_peer_id.to_string()));
+        }
+        self.driver.replace_authorized_peers(peers).await
     }
 }
 
@@ -358,6 +392,15 @@ mod tests {
         (
             P2pService {
                 driver: Some(client),
+                validator_set: ValidatorSetClient::new(
+                    PulsarClient::new(&ChainConfig {
+                        chain_id: "unused".to_owned(),
+                        comet_rpc_url: "http://127.0.0.1:26657".to_owned(),
+                        request_timeout: Duration::from_secs(1),
+                    })
+                    .unwrap(),
+                ),
+                local_peer_id: local_peer,
                 worker_stop,
                 driver_task: Some(driver_task),
                 worker_task: Some(worker_task),

@@ -69,8 +69,11 @@ pub enum Error {
     #[error("Pulsar chain client error: {0}")]
     Chain(String),
 
-    #[error("Pulsar listener error: {0}")]
-    Listener(String),
+    #[error("CometBFT chain ID mismatch: expected {expected}, got {actual}")]
+    ChainIdMismatch { expected: String, actual: String },
+
+    #[error("invalid committed verification contract: {0}")]
+    InvalidChainContract(String),
 
     #[error("local validator {0} is not in the active validator set")]
     LocalValidatorRemoved(String),

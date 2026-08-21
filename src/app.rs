@@ -7,7 +7,8 @@ use crate::{
     Error, Result,
     config::Config,
     control::ControlServer,
-    p2p::{P2pExit, P2pService},
+    listener::{ListenerExit, PulsarListener},
+    p2p::{P2pExit, P2pService, ValidatorSetUpdater},
     rpc::{RpcExit, RpcServer},
     store::ProofStore,
     verification::{VerificationWorker, VerifierRegistry},
@@ -34,19 +35,45 @@ impl App {
         } else {
             None
         };
+        let validator_updates = p2p.as_ref().map(P2pService::validator_set_updater);
         let verification_stop = CancellationToken::new();
         let mut verification_task = Some(tokio::spawn(
             verification_worker.run(verification_stop.clone()),
         ));
+        let mut listener = match start_listener(
+            config.listener,
+            config.chain.clone(),
+            Arc::clone(&proof_store),
+            validator_updates,
+            &control,
+        )
+        .await
+        {
+            Ok(ListenerStartup::Started(listener)) => Some(listener),
+            Ok(ListenerStartup::Disabled) => None,
+            Ok(ListenerStartup::Shutdown(request_result)) => {
+                cleanup_startup(&mut p2p, None, &verification_stop, &mut verification_task).await;
+                drop(control);
+                request_result?;
+                tracing::info!("pulsar verifier stopped during startup");
+                return Ok(());
+            }
+            Err(error) => {
+                cleanup_startup(&mut p2p, None, &verification_stop, &mut verification_task).await;
+                return Err(error);
+            }
+        };
         let mut rpc = if config.rpc.enabled {
             match RpcServer::start(config.rpc, Arc::clone(&proof_store)).await {
                 Ok(server) => Some(server),
                 Err(error) => {
-                    if let Some(service) = p2p.take() {
-                        service.force_shutdown().await;
-                    }
-                    verification_stop.cancel();
-                    abort_task(&mut verification_task).await;
+                    cleanup_startup(
+                        &mut p2p,
+                        listener.take(),
+                        &verification_stop,
+                        &mut verification_task,
+                    )
+                    .await;
                     return Err(error);
                 }
             }
@@ -59,53 +86,25 @@ impl App {
             "pulsar verifier started"
         );
 
-        let exit = wait_for_app_exit(&control, &mut p2p, &mut verification_task, &mut rpc).await;
+        let exit = wait_for_app_exit(
+            &control,
+            &mut p2p,
+            &mut listener,
+            &mut verification_task,
+            &mut rpc,
+        )
+        .await;
 
-        let runtime_result = match exit {
-            AppExit::Requested(request_result) => {
-                shutdown_requested(
-                    request_result,
-                    &mut p2p,
-                    &mut rpc,
-                    &verification_stop,
-                    &mut verification_task,
-                    config.runtime.shutdown_timeout,
-                )
-                .await
-            }
-            AppExit::P2pTask(task) => {
-                let error = task.into_error();
-                if let Some(service) = p2p.take() {
-                    service.force_shutdown().await;
-                }
-                verification_stop.cancel();
-                abort_task(&mut verification_task).await;
-                if let Some(server) = rpc.take() {
-                    server.force_shutdown().await;
-                }
-                Err(error)
-            }
-            AppExit::VerificationTask(task) => {
-                verification_task.take();
-                let error = unexpected_task_error(VERIFICATION_TASK, task);
-                if let Some(service) = p2p.take() {
-                    service.force_shutdown().await;
-                }
-                if let Some(server) = rpc.take() {
-                    server.force_shutdown().await;
-                }
-                Err(error)
-            }
-            AppExit::RpcTask(task) => {
-                let error = task.into_error();
-                if let Some(service) = p2p.take() {
-                    service.force_shutdown().await;
-                }
-                verification_stop.cancel();
-                abort_task(&mut verification_task).await;
-                Err(error)
-            }
-        };
+        let runtime_result = handle_app_exit(
+            exit,
+            &mut p2p,
+            &mut listener,
+            &verification_stop,
+            &mut verification_task,
+            &mut rpc,
+            config.runtime.shutdown_timeout,
+        )
+        .await;
         drop(control);
 
         runtime_result?;
@@ -114,9 +113,76 @@ impl App {
     }
 }
 
+enum ListenerStartup {
+    Started(PulsarListener),
+    Disabled,
+    Shutdown(Result<()>),
+}
+
+async fn start_listener(
+    config: crate::config::ListenerConfig,
+    chain: crate::config::ChainConfig,
+    store: Arc<ProofStore>,
+    validator_updates: Option<ValidatorSetUpdater>,
+    control: &ControlServer,
+) -> Result<ListenerStartup> {
+    if !config.enabled {
+        return Ok(ListenerStartup::Disabled);
+    }
+
+    tokio::select! {
+        result = PulsarListener::start(config, chain, store, validator_updates) => {
+            result.map(ListenerStartup::Started)
+        }
+        result = control.wait_for_shutdown() => {
+            tracing::info!("shutdown requested through control socket during startup");
+            Ok(ListenerStartup::Shutdown(result))
+        }
+        result = wait_for_signal() => {
+            tracing::info!("shutdown requested by process signal during startup");
+            Ok(ListenerStartup::Shutdown(result))
+        }
+    }
+}
+
+async fn handle_app_exit(
+    exit: AppExit,
+    p2p: &mut Option<P2pService>,
+    listener: &mut Option<PulsarListener>,
+    verification_stop: &CancellationToken,
+    verification_task: &mut Option<JoinHandle<Result<()>>>,
+    rpc: &mut Option<RpcServer>,
+    shutdown_timeout: Duration,
+) -> Result<()> {
+    let error = match exit {
+        AppExit::Requested(request_result) => {
+            return shutdown_requested(
+                request_result,
+                p2p,
+                listener,
+                rpc,
+                verification_stop,
+                verification_task,
+                shutdown_timeout,
+            )
+            .await;
+        }
+        AppExit::P2pTask(task) => task.into_error(),
+        AppExit::ListenerTask(task) => task.into_error(),
+        AppExit::VerificationTask(task) => {
+            verification_task.take();
+            unexpected_task_error(VERIFICATION_TASK, task)
+        }
+        AppExit::RpcTask(task) => task.into_error(),
+    };
+    force_shutdown_components(p2p, listener, verification_stop, verification_task, rpc).await;
+    Err(error)
+}
+
 async fn wait_for_app_exit(
     control: &ControlServer,
     p2p: &mut Option<P2pService>,
+    listener: &mut Option<PulsarListener>,
     verification_task: &mut Option<JoinHandle<Result<()>>>,
     rpc: &mut Option<RpcServer>,
 ) -> AppExit {
@@ -130,6 +196,7 @@ async fn wait_for_app_exit(
             AppExit::Requested(result)
         }
         task = wait_for_p2p_exit(p2p) => AppExit::P2pTask(task),
+        task = wait_for_listener_exit(listener) => AppExit::ListenerTask(task),
         task = wait_for_verification_exit(verification_task) => AppExit::VerificationTask(task),
         task = wait_for_rpc_exit(rpc) => AppExit::RpcTask(task),
     }
@@ -138,6 +205,7 @@ async fn wait_for_app_exit(
 async fn shutdown_requested(
     request_result: Result<()>,
     p2p: &mut Option<P2pService>,
+    listener: &mut Option<PulsarListener>,
     rpc: &mut Option<RpcServer>,
     verification_stop: &CancellationToken,
     verification_task: &mut Option<JoinHandle<Result<()>>>,
@@ -148,7 +216,13 @@ async fn shutdown_requested(
     if let Some(server) = rpc.as_mut() {
         server.mark_not_serving().await;
     }
-    // TODO: Stop future Listener and consumer-RPC producers before P2P drain.
+    // TODO: Stop the future consumer submission RPC before P2P drain.
+    if let Some(listener) = listener.take() {
+        preserve_first_error(
+            &mut first_error,
+            shutdown_listener(listener, deadline, shutdown_timeout).await,
+        );
+    }
     if let Some(service) = p2p.take() {
         preserve_first_error(
             &mut first_error,
@@ -177,8 +251,16 @@ async fn shutdown_requested(
 enum AppExit {
     Requested(Result<()>),
     P2pTask(P2pExit),
+    ListenerTask(ListenerExit),
     VerificationTask(std::result::Result<Result<()>, tokio::task::JoinError>),
     RpcTask(RpcExit),
+}
+
+async fn wait_for_listener_exit(listener: &mut Option<PulsarListener>) -> ListenerExit {
+    match listener {
+        Some(listener) => listener.wait_for_exit().await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn wait_for_rpc_exit(server: &mut Option<RpcServer>) -> RpcExit {
@@ -219,6 +301,60 @@ async fn shutdown_p2p(
             Error::ShutdownTimeout(_) => Error::ShutdownTimeout(total_timeout),
             error => error,
         })
+}
+
+async fn shutdown_listener(
+    listener: PulsarListener,
+    deadline: Instant,
+    total_timeout: Duration,
+) -> Result<()> {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        listener.force_shutdown().await;
+        return Err(Error::ShutdownTimeout(total_timeout));
+    };
+    listener
+        .shutdown(remaining)
+        .await
+        .map_err(|error| match error {
+            Error::ShutdownTimeout(_) => Error::ShutdownTimeout(total_timeout),
+            error => error,
+        })
+}
+
+async fn force_shutdown_components(
+    p2p: &mut Option<P2pService>,
+    listener: &mut Option<PulsarListener>,
+    verification_stop: &CancellationToken,
+    verification_task: &mut Option<JoinHandle<Result<()>>>,
+    rpc: &mut Option<RpcServer>,
+) {
+    if let Some(listener) = listener.take() {
+        listener.force_shutdown().await;
+    }
+    if let Some(service) = p2p.take() {
+        service.force_shutdown().await;
+    }
+    verification_stop.cancel();
+    abort_task(verification_task).await;
+    if let Some(server) = rpc.take() {
+        server.force_shutdown().await;
+    }
+}
+
+async fn cleanup_startup(
+    p2p: &mut Option<P2pService>,
+    listener: Option<PulsarListener>,
+    verification_stop: &CancellationToken,
+    verification_task: &mut Option<JoinHandle<Result<()>>>,
+) {
+    if let Some(listener) = listener {
+        listener.force_shutdown().await;
+    }
+    if let Some(service) = p2p.take() {
+        service.force_shutdown().await;
+    }
+    verification_stop.cancel();
+    abort_task(verification_task).await;
 }
 
 async fn shutdown_rpc(server: RpcServer, deadline: Instant, total_timeout: Duration) -> Result<()> {
@@ -323,10 +459,8 @@ mod tests {
         control::request_shutdown,
     };
 
-    #[tokio::test]
-    async fn app_stops_through_control_socket() {
-        let temp_dir = TempDir::new().unwrap();
-        let config = Config {
+    fn test_config(temp_dir: &TempDir) -> Config {
+        Config {
             runtime: RuntimeConfig {
                 control_socket: temp_dir.path().join("runtime/control.sock"),
                 shutdown_timeout: Duration::from_secs(2),
@@ -350,7 +484,13 @@ mod tests {
                 retry_backoff: Duration::ZERO,
             },
             rpc: RpcConfig::disabled(),
-        };
+        }
+    }
+
+    #[tokio::test]
+    async fn app_stops_through_control_socket() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = test_config(&temp_dir);
         let client_config = config.runtime.clone();
 
         let app = tokio::spawn(App::run(config));
@@ -363,6 +503,35 @@ mod tests {
 
         request_shutdown(&client_config).await.unwrap();
         app.await.unwrap().unwrap();
+        assert!(!client_config.control_socket.exists());
+    }
+
+    #[tokio::test]
+    async fn app_can_stop_while_listener_is_reconnecting_during_startup() {
+        let temp_dir = TempDir::new().unwrap();
+        let mut config = test_config(&temp_dir);
+        config.chain.chain_id = "pulsar-test-1".to_owned();
+        config.chain.comet_rpc_url = "http://127.0.0.1:9".to_owned();
+        config.chain.request_timeout = Duration::from_millis(50);
+        config.listener.enabled = true;
+        config.listener.reconnect_initial_backoff = Duration::from_millis(10);
+        config.listener.reconnect_max_backoff = Duration::from_millis(20);
+        let client_config = config.runtime.clone();
+
+        let app = tokio::spawn(App::run(config));
+        for _ in 0..40 {
+            if client_config.control_socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        request_shutdown(&client_config).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), app)
+            .await
+            .expect("application should stop while listener startup retries")
+            .unwrap()
+            .unwrap();
         assert!(!client_config.control_socket.exists());
     }
 }

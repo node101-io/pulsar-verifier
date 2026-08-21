@@ -25,8 +25,20 @@ pub(crate) struct ChainStatus {
     pub(crate) latest_height: u64,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CommittedBlock {
+    pub(crate) height: u64,
+    pub(crate) validators_hash: [u8; 32],
+    pub(crate) events: Vec<CommittedEvent>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub(crate) struct CommittedEvent {
+    pub(crate) kind: String,
+    pub(crate) attributes: Vec<(String, String)>,
+}
+
 /// One owned `NewBlock` subscription and the transport task that drives it.
-#[allow(dead_code, reason = "used by the listener in the next stacked change")]
 pub(crate) struct NewBlockSubscription {
     client: Option<WebSocketClient>,
     events: Option<Subscription>,
@@ -35,9 +47,8 @@ pub(crate) struct NewBlockSubscription {
 }
 
 impl NewBlockSubscription {
-    #[allow(dead_code, reason = "used by the listener in the next stacked change")]
-    pub(crate) async fn next(&mut self) -> Result<Option<Event>> {
-        timeout(
+    pub(crate) async fn next(&mut self) -> Result<Option<CommittedBlock>> {
+        let event = timeout(
             self.timeout,
             self.events
                 .as_mut()
@@ -47,10 +58,10 @@ impl NewBlockSubscription {
         .await
         .map_err(|_| Error::Chain("NewBlock subscription timed out".to_owned()))?
         .transpose()
-        .map_err(chain_error)
+        .map_err(chain_error)?;
+        event.map(committed_block).transpose()
     }
 
-    #[allow(dead_code, reason = "used by the listener in the next stacked change")]
     pub(crate) async fn close(mut self) -> Result<()> {
         self.events.take();
         if let Some(client) = self.client.take() {
@@ -115,10 +126,10 @@ impl PulsarClient {
         let status = self.with_timeout("status", self.http.status()).await?;
         let actual_chain_id = status.node_info.network.to_string();
         if actual_chain_id != self.chain_id {
-            return Err(Error::Chain(format!(
-                "CometBFT chain ID mismatch: expected {}, got {actual_chain_id}",
-                self.chain_id
-            )));
+            return Err(Error::ChainIdMismatch {
+                expected: self.chain_id.clone(),
+                actual: actual_chain_id,
+            });
         }
         if status.sync_info.catching_up {
             return Err(Error::Chain(
@@ -175,8 +186,28 @@ impl PulsarClient {
         Ok(unique.into_iter().collect())
     }
 
+    pub(crate) async fn validators_hash(&self, height: u64) -> Result<[u8; 32]> {
+        let height_u32 = u32::try_from(height)
+            .map_err(|_| Error::Chain(format!("block height {height} exceeds u32")))?;
+        let response = self
+            .with_timeout("block", self.http.block(height_u32))
+            .await?;
+        if response.block.header.height.value() != height {
+            return Err(Error::Chain(format!(
+                "block response height {} does not match requested height {height}",
+                response.block.header.height.value()
+            )));
+        }
+        response
+            .block
+            .header
+            .validators_hash
+            .as_bytes()
+            .try_into()
+            .map_err(|_| Error::Chain("validators_hash must contain 32 bytes".to_owned()))
+    }
+
     /// Recovers pending verification requests submitted at one block height.
-    #[allow(dead_code, reason = "used by the listener in the next stacked change")]
     pub(crate) async fn proofs_by_height(&self, height: u64) -> Result<Vec<ChainProof>> {
         if height == 0 {
             return Err(Error::Chain(
@@ -186,8 +217,15 @@ impl PulsarClient {
         let mut next_key = Vec::new();
         let mut proofs = Vec::new();
         let mut positions = HashSet::new();
+        let mut pagination_keys = HashSet::new();
+        let mut last_index = None;
 
         loop {
+            if !pagination_keys.insert(next_key.clone()) {
+                return Err(Error::InvalidChainContract(
+                    "ProofsByHeight repeated a pagination key".to_owned(),
+                ));
+            }
             let request = QueryProofsByHeightRequest {
                 submission_height: height,
                 pagination: Some(PageRequest {
@@ -217,25 +255,35 @@ impl PulsarClient {
                 )));
             }
             let page = QueryProofsByHeightResponse::decode(response.value.as_slice()).map_err(
-                |error| Error::Chain(format!("invalid ProofsByHeight response: {error}")),
+                |error| {
+                    Error::InvalidChainContract(format!("invalid ProofsByHeight response: {error}"))
+                },
             )?;
             let page_was_empty = page.proofs.is_empty();
             for proof in page.proofs {
                 let key = proof.proof_key.as_ref().ok_or_else(|| {
-                    Error::Chain("proof query response is missing proof_key".to_owned())
+                    Error::InvalidChainContract(
+                        "proof query response is missing proof_key".to_owned(),
+                    )
                 })?;
                 if !positions.insert((key.submission_height, key.index_in_block)) {
-                    return Err(Error::Chain(format!(
+                    return Err(Error::InvalidChainContract(format!(
                         "duplicate proof index {} at height {}",
                         key.index_in_block, key.submission_height
                     )));
                 }
+                if last_index.is_some_and(|index| key.index_in_block <= index) {
+                    return Err(Error::InvalidChainContract(
+                        "ProofsByHeight records are not strictly ordered by proof key".to_owned(),
+                    ));
+                }
+                last_index = Some(key.index_in_block);
                 if let Some(proof) = validate_query_proof(proof, height)? {
                     proofs.push(proof);
                 }
             }
             if positions.len() > MAX_PROOFS_PER_BLOCK {
-                return Err(Error::Chain(format!(
+                return Err(Error::InvalidChainContract(format!(
                     "ProofsByHeight returned more than {MAX_PROOFS_PER_BLOCK} records"
                 )));
             }
@@ -245,17 +293,15 @@ impl PulsarClient {
                 break;
             }
             if page_was_empty {
-                return Err(Error::Chain(
+                return Err(Error::InvalidChainContract(
                     "ProofsByHeight returned an empty page with a continuation key".to_owned(),
                 ));
             }
         }
 
-        proofs.sort_unstable_by_key(|proof| proof.index_in_block);
         Ok(proofs)
     }
 
-    #[allow(dead_code, reason = "used by the listener in the next stacked change")]
     pub(crate) async fn subscribe_new_blocks(&self) -> Result<NewBlockSubscription> {
         let websocket_url = websocket_url(&self.rpc_url)?;
         let url: WebSocketClientUrl = websocket_url.as_str().try_into().map_err(chain_error)?;
@@ -303,6 +349,74 @@ impl PulsarClient {
     }
 }
 
+fn committed_block(event: Event) -> Result<CommittedBlock> {
+    let tendermint_rpc::event::EventData::NewBlock {
+        block,
+        result_finalize_block,
+        ..
+    } = event.data
+    else {
+        return Err(Error::InvalidChainContract(
+            "NewBlock subscription returned a different event type".to_owned(),
+        ));
+    };
+    let block = block.ok_or_else(|| {
+        Error::InvalidChainContract("NewBlock event is missing block data".to_owned())
+    })?;
+    let finalize = result_finalize_block.ok_or_else(|| {
+        Error::InvalidChainContract("NewBlock event is missing FinalizeBlock data".to_owned())
+    })?;
+    let validators_hash = block
+        .header
+        .validators_hash
+        .as_bytes()
+        .try_into()
+        .map_err(|_| {
+            Error::InvalidChainContract("block validators_hash must contain 32 bytes".to_owned())
+        })?;
+    let mut events = Vec::new();
+    for tx in finalize.tx_results {
+        if !tx.code.is_ok() {
+            continue;
+        }
+        for event in tx.events {
+            let attributes = event
+                .attributes
+                .iter()
+                .map(|attribute| {
+                    Ok((
+                        attribute
+                            .key_str()
+                            .map_err(|error| {
+                                Error::InvalidChainContract(format!(
+                                    "event attribute key is not UTF-8: {error}"
+                                ))
+                            })?
+                            .to_owned(),
+                        attribute
+                            .value_str()
+                            .map_err(|error| {
+                                Error::InvalidChainContract(format!(
+                                    "event attribute value is not UTF-8: {error}"
+                                ))
+                            })?
+                            .to_owned(),
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            events.push(CommittedEvent {
+                kind: event.kind,
+                attributes,
+            });
+        }
+    }
+    Ok(CommittedBlock {
+        height: block.header.height.value(),
+        validators_hash,
+        events,
+    })
+}
+
 fn websocket_url(http_url: &str) -> Result<String> {
     let (scheme, rest) = http_url.split_once("://").ok_or_else(|| {
         Error::InvalidConfig("chain.comet_rpc_url must include an HTTP scheme".to_owned())
@@ -326,7 +440,29 @@ fn chain_error(error: impl fmt::Display) -> Error {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use base64::{Engine as _, engine::general_purpose::STANDARD};
+    use libp2p::identity;
+    use pulsar_verifier_proto::{
+        chain_v1::{
+            ProofKey, ProofRecord, QueryProofResponse, QueryProofsByHeightResponse,
+            query_proof_response,
+        },
+        cosmos::base::query::v1beta1::PageResponse,
+    };
+    use serde_json::Value;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::{TcpListener, TcpStream},
+        task::JoinHandle,
+    };
+    use tokio_util::sync::CancellationToken;
+
     use super::*;
+    use crate::proof::{ProofType, VerificationId};
+
+    type Handler = Arc<dyn Fn(Value) -> Value + Send + Sync>;
 
     #[test]
     fn derives_websocket_url() {
@@ -339,5 +475,279 @@ mod tests {
             "wss://rpc.example.test/websocket"
         );
         assert!(websocket_url("ftp://rpc.example.test").is_err());
+    }
+
+    #[tokio::test]
+    async fn validates_status_and_paginates_exact_validator_height() {
+        let validators = (0..101)
+            .map(|_| validator(identity::Keypair::generate_ed25519().public()))
+            .collect::<Vec<_>>();
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let handler: Handler = Arc::new(move |request| {
+            recorded.lock().unwrap().push(request.clone());
+            let result = match request["method"].as_str().unwrap() {
+                "status" => status("pulsar-test", 42, false),
+                "validators" => {
+                    let page = request["params"]["page"]
+                        .as_str()
+                        .unwrap()
+                        .parse::<usize>()
+                        .unwrap();
+                    let values = validators
+                        .iter()
+                        .skip((page - 1) * 100)
+                        .take(100)
+                        .cloned()
+                        .collect::<Vec<_>>();
+                    serde_json::json!({
+                        "block_height": "42",
+                        "validators": values,
+                        "count": values.len().to_string(),
+                        "total": validators.len().to_string(),
+                    })
+                }
+                method => panic!("unexpected RPC method {method}"),
+            };
+            rpc_result(&request, &result)
+        });
+        let (url, stop, server) = spawn_rpc_server(handler).await;
+        let client = client(url);
+
+        assert_eq!(client.status().await.unwrap().latest_height, 42);
+        assert_eq!(client.validator_public_keys(42).await.unwrap().len(), 101);
+        {
+            let calls = calls.lock().unwrap();
+            let validator_calls = calls
+                .iter()
+                .filter(|request| request["method"] == "validators")
+                .collect::<Vec<_>>();
+            assert_eq!(validator_calls.len(), 2);
+            assert!(
+                validator_calls
+                    .iter()
+                    .all(|request| request["params"]["height"] == "42")
+            );
+        }
+
+        stop.cancel();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn decodes_and_validates_proofs_by_height() {
+        let id = VerificationId::from_component_hashes(
+            ProofType::NoirBarretenberg,
+            &[1; 32],
+            &[2; 32],
+            &[3; 32],
+        );
+        let response = QueryProofsByHeightResponse {
+            proofs: vec![QueryProofResponse {
+                proof_key: Some(ProofKey {
+                    submission_height: 42,
+                    index_in_block: 0,
+                }),
+                state: Some(query_proof_response::State::Pending(ProofRecord {
+                    proof_hash: vec![1; 32],
+                    proof_type: 2,
+                    public_inputs_hash: vec![2; 32],
+                    verification_key_hash: vec![3; 32],
+                    verification_id: id.as_bytes().to_vec(),
+                })),
+            }],
+            pagination: Some(PageResponse {
+                next_key: Vec::new(),
+                total: 1,
+            }),
+        };
+        let encoded = STANDARD.encode(response.encode_to_vec());
+        let handler: Handler = Arc::new(move |request| {
+            assert_eq!(request["method"], "abci_query");
+            rpc_result(
+                &request,
+                &serde_json::json!({
+                    "response": {
+                        "code": 0,
+                        "codespace": "",
+                        "height": "42",
+                        "index": "0",
+                        "info": "",
+                        "key": "",
+                        "log": "",
+                        "proofOps": null,
+                        "value": encoded,
+                    }
+                }),
+            )
+        });
+        let (url, stop, server) = spawn_rpc_server(handler).await;
+
+        let proofs = client(url).proofs_by_height(42).await.unwrap();
+        assert_eq!(proofs.len(), 1);
+        assert_eq!(proofs[0].verification_id, id);
+
+        stop.cancel();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rejects_chain_id_mismatch_and_syncing_node() {
+        for result in [status("wrong", 9, false), status("expected", 9, true)] {
+            let handler: Handler = Arc::new(move |request| rpc_result(&request, &result));
+            let (url, stop, server) = spawn_rpc_server(handler).await;
+            assert!(client(url).status().await.is_err());
+            stop.cancel();
+            server.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    #[ignore = "requires a running Pulsar/CometBFT v0.38.21 node"]
+    async fn real_cometbft_v0_38_compatibility_smoke() {
+        let rpc_url = std::env::var("PULSAR_COMET_RPC_URL")
+            .expect("PULSAR_COMET_RPC_URL must point to the test node");
+        let chain_id =
+            std::env::var("PULSAR_CHAIN_ID").expect("PULSAR_CHAIN_ID must match the test node");
+        let client = PulsarClient::new(&ChainConfig {
+            chain_id,
+            comet_rpc_url: rpc_url,
+            request_timeout: Duration::from_secs(10),
+        })
+        .unwrap();
+
+        let status = client.status().await.unwrap();
+        assert!(
+            !client
+                .validator_public_keys(status.latest_height)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        let subscription = client.subscribe_new_blocks().await.unwrap();
+        subscription.close().await.unwrap();
+    }
+
+    fn client(url: String) -> PulsarClient {
+        PulsarClient::new(&ChainConfig {
+            chain_id: "pulsar-test".to_owned(),
+            comet_rpc_url: url,
+            request_timeout: Duration::from_secs(2),
+        })
+        .unwrap()
+    }
+
+    fn validator(public: identity::PublicKey) -> Value {
+        let public = public.try_into_ed25519().unwrap();
+        serde_json::json!({
+            "address": "0000000000000000000000000000000000000000",
+            "pub_key": {
+                "type": "tendermint/PubKeyEd25519",
+                "value": STANDARD.encode(public.to_bytes()),
+            },
+            "voting_power": "1",
+            "proposer_priority": "0",
+        })
+    }
+
+    fn status(chain_id: &str, height: u64, catching_up: bool) -> Value {
+        serde_json::json!({
+            "node_info": {
+                "protocol_version": { "p2p": "8", "block": "11", "app": "1" },
+                "id": "0000000000000000000000000000000000000000",
+                "listen_addr": "tcp://0.0.0.0:26656",
+                "network": chain_id,
+                "version": "0.38.21",
+                "channels": "40202122233038606100",
+                "moniker": "test",
+                "other": { "tx_index": "on", "rpc_address": "tcp://0.0.0.0:26657" }
+            },
+            "sync_info": {
+                "latest_block_hash": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+                "latest_app_hash": "",
+                "latest_block_height": height.to_string(),
+                "latest_block_time": "2026-01-01T00:00:00Z",
+                "earliest_block_hash": "BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB",
+                "earliest_app_hash": "",
+                "earliest_block_height": "1",
+                "earliest_block_time": "2026-01-01T00:00:00Z",
+                "catching_up": catching_up
+            },
+            "validator_info": {
+                "address": "0000000000000000000000000000000000000000",
+                "pub_key": {
+                    "type": "tendermint/PubKeyEd25519",
+                    "value": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA="
+                },
+                "voting_power": "1"
+            }
+        })
+    }
+
+    fn rpc_result(request: &Value, result: &Value) -> Value {
+        serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": request["id"].clone(),
+            "result": result,
+        })
+    }
+
+    async fn spawn_rpc_server(handler: Handler) -> (String, CancellationToken, JoinHandle<()>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let cancellation = CancellationToken::new();
+        let task_cancellation = cancellation.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    () = task_cancellation.cancelled() => return,
+                    accepted = listener.accept() => {
+                        let (stream, _) = accepted.unwrap();
+                        let handler = Arc::clone(&handler);
+                        tokio::spawn(async move { serve_connection(stream, handler).await });
+                    }
+                }
+            }
+        });
+        (format!("http://{address}"), cancellation, task)
+    }
+
+    async fn serve_connection(mut stream: TcpStream, handler: Handler) {
+        let mut bytes = Vec::new();
+        let header_end = loop {
+            let mut chunk = [0_u8; 1024];
+            let count = stream.read(&mut chunk).await.unwrap();
+            if count == 0 {
+                return;
+            }
+            bytes.extend_from_slice(&chunk[..count]);
+            if let Some(position) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                break position + 4;
+            }
+        };
+        let headers = String::from_utf8_lossy(&bytes[..header_end]);
+        let content_length = headers
+            .lines()
+            .find_map(|line| {
+                line.strip_prefix("content-length: ")
+                    .or_else(|| line.strip_prefix("Content-Length: "))
+            })
+            .unwrap()
+            .trim()
+            .parse::<usize>()
+            .unwrap();
+        while bytes.len() < header_end + content_length {
+            let mut chunk = vec![0_u8; header_end + content_length - bytes.len()];
+            let count = stream.read(&mut chunk).await.unwrap();
+            bytes.extend_from_slice(&chunk[..count]);
+        }
+        let request: Value =
+            serde_json::from_slice(&bytes[header_end..header_end + content_length]).unwrap();
+        let body = handler(request).to_string();
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        stream.write_all(response.as_bytes()).await.unwrap();
     }
 }
