@@ -7,6 +7,7 @@ use pulsar_verifier_proto::{
     chain_v1::{QueryProofsByHeightRequest, QueryProofsByHeightResponse},
     cosmos::base::query::v1beta1::PageRequest,
 };
+use tendermint::block::Height;
 use tendermint_rpc::{
     Client as _, HttpClient, HttpClientUrl, Paging, Subscription, SubscriptionClient as _,
     WebSocketClient, WebSocketClientUrl, client::CompatMode, event::Event, query::EventType,
@@ -171,7 +172,7 @@ impl PulsarClient {
 
     /// Loads one complete validator snapshot at an exact committed height.
     pub(crate) async fn validator_public_keys(&self, height: u64) -> Result<Vec<[u8; 32]>> {
-        let height = tendermint::block::Height::try_from(height)
+        let height = Height::try_from(height)
             .map_err(|error| Error::Chain(format!("invalid validator height: {error}")))?;
         let response = self
             .with_timeout("validators", self.http.validators(height, Paging::All))
@@ -216,7 +217,7 @@ impl PulsarClient {
     }
 
     pub(crate) async fn validators_hash(&self, height: u64) -> Result<[u8; 32]> {
-        let height = tendermint::block::Height::try_from(height)
+        let height = Height::try_from(height)
             .map_err(|error| Error::Chain(format!("invalid block height: {error}")))?;
         let response = self.with_timeout("block", self.http.block(height)).await?;
         if response.block.header.height != height {
@@ -276,17 +277,7 @@ impl PulsarClient {
                     ),
                 )
                 .await?;
-            if let Some(expected) = query_height {
-                if response.height != expected {
-                    return Err(Error::InvalidChainContract(format!(
-                        "ProofsByHeight response height {} does not match pinned height {}",
-                        response.height.value(),
-                        expected.value()
-                    )));
-                }
-            } else {
-                query_height = Some(response.height);
-            }
+            pin_query_height(&mut query_height, response.height)?;
             if !response.code.is_ok() {
                 return Err(Error::Chain(format!(
                     "ProofsByHeight ABCI query failed with code {}: {}",
@@ -455,6 +446,21 @@ fn committed_block(event: Event) -> Result<CommittedBlock> {
         validators_hash,
         events,
     })
+}
+
+fn pin_query_height(pinned: &mut Option<Height>, response: Height) -> Result<()> {
+    if let Some(expected) = *pinned {
+        if response != expected {
+            return Err(Error::InvalidChainContract(format!(
+                "ProofsByHeight response height {} does not match pinned height {}",
+                response.value(),
+                expected.value()
+            )));
+        }
+    } else {
+        *pinned = Some(response);
+    }
+    Ok(())
 }
 
 fn websocket_url(http_url: &str) -> Result<String> {
@@ -676,7 +682,7 @@ mod tests {
                     })),
                 }],
                 pagination: Some(PageResponse {
-                    next_key: (index == 0).then(|| vec![7]).unwrap_or_default(),
+                    next_key: if index == 0 { vec![7] } else { Vec::new() },
                     total: 2,
                 }),
             };

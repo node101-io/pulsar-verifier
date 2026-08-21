@@ -38,6 +38,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     println!("cargo:rerun-if-changed=proto/cosmos_proto/cosmos.proto");
     println!("cargo:rerun-if-changed=proto/google/api/annotations.proto");
     println!("cargo:rerun-if-changed=proto/google/api/http.proto");
+    println!("cargo:rerun-if-changed=proto/google/protobuf/descriptor.proto");
     println!("cargo:rerun-if-changed=proto/pulsar/verifier/v1/proof.proto");
     println!("cargo:rerun-if-changed=proto/pulsar/verifier/v1/availability.proto");
     println!("cargo:rerun-if-changed=proto/pulsar/verifier/v1/exchange.proto");

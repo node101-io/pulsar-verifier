@@ -59,7 +59,13 @@ impl ProofStore {
         }
         let maximum_weight = u32::try_from(config.max_proof_bytes)
             .ok()
-            .and_then(|weight| weight.checked_add(METADATA_WEIGHT_BYTES));
+            .and_then(|weight| weight.checked_add(METADATA_WEIGHT_BYTES))
+            .and_then(|weight| {
+                record::FAILURE_CODE_MAX_BYTES
+                    .checked_add(record::FAILURE_MESSAGE_MAX_BYTES)
+                    .and_then(|failure| u32::try_from(failure).ok())
+                    .and_then(|failure| weight.checked_add(failure))
+            });
         if maximum_weight.is_none() {
             return Err(Error::ProofStore(
                 "maximum proof size exceeds Moka's per-entry weight range".to_owned(),
@@ -576,9 +582,14 @@ fn proof_weight(record: &ProofRecord) -> u32 {
     let payload = record.proof.as_ref().map_or(0, |proof| {
         proof.payload_len().expect("proof size was validated")
     });
+    let failure = match record.metadata.verification.as_ref() {
+        Some(VerificationState::Failed(failure)) => failure.code().len() + failure.message().len(),
+        _ => 0,
+    };
     u32::try_from(payload)
         .expect("validated proof size fits Moka weight")
         .checked_add(METADATA_WEIGHT_BYTES)
+        .and_then(|weight| weight.checked_add(u32::try_from(failure).ok()?))
         .expect("validated proof weight fits Moka weight")
 }
 
@@ -927,6 +938,23 @@ mod tests {
         sleep(Duration::from_millis(1_100)).await;
         store.run_pending_tasks().await;
         assert!(store.get(id).await.is_some());
+    }
+
+    #[tokio::test]
+    async fn failed_record_weight_includes_bounded_diagnostics() {
+        let store = ProofStore::new(config()).unwrap();
+        let id = stored_chain_proof(&store, b"failed-weight").await;
+        let job = store.begin_verification(id).await.unwrap().unwrap();
+        let before = proof_weight(store.get(id).await.unwrap().as_ref());
+        let failure = VerificationFailure::new("backend_error", "bounded message", false).unwrap();
+        let diagnostic_bytes = failure.code().len() + failure.message().len();
+        store
+            .finish_verification(&job, VerificationOutcome::Failed(failure))
+            .await
+            .unwrap();
+        let after = proof_weight(store.get(id).await.unwrap().as_ref());
+
+        assert_eq!(after - before, u32::try_from(diagnostic_bytes).unwrap());
     }
 
     #[tokio::test]
