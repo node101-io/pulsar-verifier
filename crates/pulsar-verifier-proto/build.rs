@@ -4,6 +4,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let proto_root = PathBuf::from("proto");
     let files = [
         proto_root.join("pulsarchain/verification/v1/types.proto"),
+        proto_root.join("pulsarchain/verification/v1/params.proto"),
+        proto_root.join("pulsarchain/verification/v1/query.proto"),
         proto_root.join("pulsar/verifier/v1/proof.proto"),
         proto_root.join("pulsar/verifier/v1/availability.proto"),
         proto_root.join("pulsar/verifier/v1/exchange.proto"),
@@ -16,6 +18,12 @@ fn main() -> Result<(), Box<dyn Error>> {
     tonic_build::configure().compile_protos_with_config(config, &files, &[proto_root])?;
 
     println!("cargo:rerun-if-changed=proto/pulsarchain/verification/v1/types.proto");
+    println!("cargo:rerun-if-changed=proto/pulsarchain/verification/v1/params.proto");
+    println!("cargo:rerun-if-changed=proto/pulsarchain/verification/v1/query.proto");
+    println!("cargo:rerun-if-changed=proto/cosmos/base/query/v1beta1/pagination.proto");
+    println!("cargo:rerun-if-changed=proto/cosmos_proto/cosmos.proto");
+    println!("cargo:rerun-if-changed=proto/google/api/annotations.proto");
+    println!("cargo:rerun-if-changed=proto/google/api/http.proto");
     println!("cargo:rerun-if-changed=proto/pulsar/verifier/v1/proof.proto");
     println!("cargo:rerun-if-changed=proto/pulsar/verifier/v1/availability.proto");
     println!("cargo:rerun-if-changed=proto/pulsar/verifier/v1/exchange.proto");

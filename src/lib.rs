@@ -4,6 +4,7 @@ pub mod proof;
 pub mod store;
 
 mod app;
+mod chain;
 mod control;
 mod error;
 mod p2p;

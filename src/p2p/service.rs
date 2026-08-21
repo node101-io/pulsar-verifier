@@ -3,7 +3,12 @@ use std::{sync::Arc, time::Duration};
 use tokio::{task::JoinHandle, time::timeout};
 use tokio_util::sync::CancellationToken;
 
-use crate::{Error, Result, config::P2pConfig, store::ProofStore};
+use crate::{
+    Error, Result,
+    chain::PulsarClient,
+    config::{ChainConfig, P2pConfig},
+    store::ProofStore,
+};
 
 use super::{
     Driver, DriverClient, DriverParts, ValidatorSetClient, Worker, load_validator_identity,
@@ -37,14 +42,14 @@ pub(crate) struct P2pService {
 }
 
 impl P2pService {
-    pub(crate) async fn start(config: &P2pConfig, store: Arc<ProofStore>) -> Result<Self> {
+    pub(crate) async fn start(
+        config: &P2pConfig,
+        chain_config: &ChainConfig,
+        store: Arc<ProofStore>,
+    ) -> Result<Self> {
         let identity = load_validator_identity(&config.validator_key_path)?;
         let local_peer_id = identity.public().to_peer_id();
-        let validator_client = ValidatorSetClient::new(
-            config.comet_rpc_url.clone(),
-            config.chain_id.clone(),
-            config.comet_rpc_timeout,
-        )?;
+        let validator_client = ValidatorSetClient::new(PulsarClient::new(chain_config)?);
         let authorized_peers = validator_client.load().await?;
         if !authorized_peers.contains(&local_peer_id) {
             return Err(Error::P2pAuthorization(format!(
@@ -237,11 +242,9 @@ mod tests {
         },
     };
 
-    use libp2p::{Multiaddr, identity};
-    use reqwest::Url;
-
     use super::*;
     use crate::config::ProofStoreConfig;
+    use libp2p::{Multiaddr, identity};
 
     #[tokio::test]
     async fn ordered_shutdown_is_repeatable() {
@@ -370,8 +373,6 @@ mod tests {
             listen_addresses: vec!["/ip4/127.0.0.1/tcp/0".parse::<Multiaddr>().unwrap()],
             bootnodes: Vec::new(),
             validator_key_path: PathBuf::from("/unused"),
-            comet_rpc_url: Url::parse("http://127.0.0.1:26657").unwrap(),
-            comet_rpc_timeout: Duration::from_secs(1),
             max_availability_message_bytes: 64 * 1024,
             max_proof_bytes: 8 * 1024 * 1024,
             proof_request_timeout: Duration::from_secs(1),

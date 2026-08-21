@@ -2,7 +2,6 @@ use std::{collections::HashSet, net::TcpListener, path::PathBuf, sync::Arc, time
 
 use bytes::Bytes;
 use libp2p::{Multiaddr, PeerId, identity};
-use reqwest::Url;
 use tokio::{sync::mpsc, task::JoinHandle, time::timeout};
 use tokio_util::sync::CancellationToken;
 
@@ -101,8 +100,6 @@ fn test_config(listen_address: Multiaddr) -> P2pConfig {
         listen_addresses: vec![listen_address],
         bootnodes: Vec::new(),
         validator_key_path: PathBuf::from("/unused"),
-        comet_rpc_url: Url::parse("http://127.0.0.1:26657").unwrap(),
-        comet_rpc_timeout: Duration::from_secs(1),
         max_availability_message_bytes: 64 * 1024,
         max_proof_bytes: 8 * 1024 * 1024,
         proof_request_timeout: Duration::from_secs(3),

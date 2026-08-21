@@ -30,7 +30,7 @@ impl App {
             config.verification,
         );
         let mut p2p = if config.p2p.enabled {
-            Some(P2pService::start(&config.p2p, Arc::clone(&proof_store)).await?)
+            Some(P2pService::start(&config.p2p, &config.chain, Arc::clone(&proof_store)).await?)
         } else {
             None
         };
@@ -316,7 +316,10 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::{P2pConfig, ProofStoreConfig, RpcConfig, RuntimeConfig, VerificationConfig},
+        config::{
+            ChainConfig, ListenerConfig, P2pConfig, ProofStoreConfig, RpcConfig, RuntimeConfig,
+            VerificationConfig,
+        },
         control::request_shutdown,
     };
 
@@ -327,6 +330,16 @@ mod tests {
             runtime: RuntimeConfig {
                 control_socket: temp_dir.path().join("runtime/control.sock"),
                 shutdown_timeout: Duration::from_secs(2),
+            },
+            chain: ChainConfig {
+                chain_id: String::new(),
+                comet_rpc_url: "http://127.0.0.1:26657".to_owned(),
+                request_timeout: Duration::from_secs(1),
+            },
+            listener: ListenerConfig {
+                enabled: false,
+                reconnect_initial_backoff: Duration::from_millis(250),
+                reconnect_max_backoff: Duration::from_secs(30),
             },
             proof_store: ProofStoreConfig::test_default(),
             p2p: P2pConfig::disabled(),

@@ -6,8 +6,8 @@ use std::{
 };
 
 use libp2p::Multiaddr;
-use reqwest::Url;
 use serde::Deserialize;
+use tendermint_rpc::HttpClient;
 
 use crate::{Error, Result};
 
@@ -15,10 +15,28 @@ use crate::{Error, Result};
 #[derive(Debug, Clone)]
 pub struct Config {
     pub runtime: RuntimeConfig,
+    pub chain: ChainConfig,
+    pub listener: ListenerConfig,
     pub proof_store: ProofStoreConfig,
     pub p2p: P2pConfig,
     pub verification: VerificationConfig,
     pub rpc: RpcConfig,
+}
+
+/// Shared Pulsar chain identity and local `CometBFT` RPC settings.
+#[derive(Debug, Clone)]
+pub struct ChainConfig {
+    pub chain_id: String,
+    pub comet_rpc_url: String,
+    pub request_timeout: Duration,
+}
+
+/// Committed-block listener reconnect settings.
+#[derive(Debug, Clone, Copy)]
+pub struct ListenerConfig {
+    pub enabled: bool,
+    pub reconnect_initial_backoff: Duration,
+    pub reconnect_max_backoff: Duration,
 }
 
 /// Loopback-only chain-facing gRPC server settings.
@@ -71,8 +89,6 @@ pub struct P2pConfig {
     pub listen_addresses: Vec<Multiaddr>,
     pub bootnodes: Vec<Multiaddr>,
     pub validator_key_path: PathBuf,
-    pub comet_rpc_url: Url,
-    pub comet_rpc_timeout: Duration,
     pub max_availability_message_bytes: usize,
     pub max_proof_bytes: usize,
     pub proof_request_timeout: Duration,
@@ -83,7 +99,7 @@ pub struct P2pConfig {
 impl P2pConfig {
     #[cfg(test)]
     pub(crate) fn disabled() -> Self {
-        validate_p2p(FileP2pConfig::default(), 8 * 1024 * 1024)
+        validate_p2p(FileP2pConfig::default(), 8 * 1024 * 1024, String::new())
             .expect("default P2P config must be valid")
     }
 }
@@ -101,6 +117,10 @@ impl ProofStoreConfig {
 struct FileConfig {
     runtime: FileRuntimeConfig,
     #[serde(default)]
+    chain: FileChainConfig,
+    #[serde(default)]
+    listener: FileListenerConfig,
+    #[serde(default)]
     proof_store: FileProofStoreConfig,
     #[serde(default)]
     p2p: FileP2pConfig,
@@ -108,6 +128,42 @@ struct FileConfig {
     verification: FileVerificationConfig,
     #[serde(default)]
     rpc: FileRpcConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileChainConfig {
+    chain_id: String,
+    comet_rpc_url: String,
+    request_timeout_secs: u64,
+}
+
+impl Default for FileChainConfig {
+    fn default() -> Self {
+        Self {
+            chain_id: String::new(),
+            comet_rpc_url: "http://127.0.0.1:26657".to_owned(),
+            request_timeout_secs: 5,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(default, deny_unknown_fields)]
+struct FileListenerConfig {
+    enabled: bool,
+    reconnect_initial_backoff_millis: u64,
+    reconnect_max_backoff_secs: u64,
+}
+
+impl Default for FileListenerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reconnect_initial_backoff_millis: 250,
+            reconnect_max_backoff_secs: 30,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -177,12 +233,9 @@ struct FileRuntimeConfig {
 #[serde(default, deny_unknown_fields)]
 struct FileP2pConfig {
     enabled: bool,
-    chain_id: String,
     listen_addresses: Vec<String>,
     bootnodes: Vec<String>,
     validator_key_path: PathBuf,
-    comet_rpc_url: String,
-    comet_rpc_timeout_secs: u64,
     max_availability_message_bytes: usize,
     proof_request_timeout_secs: u64,
     command_buffer: usize,
@@ -193,12 +246,9 @@ impl Default for FileP2pConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            chain_id: String::new(),
             listen_addresses: Vec::new(),
             bootnodes: Vec::new(),
             validator_key_path: PathBuf::new(),
-            comet_rpc_url: "http://127.0.0.1:26657".to_owned(),
-            comet_rpc_timeout_secs: 5,
             max_availability_message_bytes: 64 * 1024,
             proof_request_timeout_secs: 10,
             command_buffer: 64,
@@ -241,7 +291,13 @@ impl Config {
             shutdown_timeout: Duration::from_secs(file.runtime.shutdown_timeout_secs),
         };
         let proof_store = validate_proof_store(file.proof_store)?;
-        let p2p = validate_p2p(file.p2p, proof_store.max_proof_bytes)?;
+        let listener = validate_listener(file.listener)?;
+        let chain = validate_chain(file.chain, file.p2p.enabled || listener.enabled)?;
+        let p2p = validate_p2p(
+            file.p2p,
+            proof_store.max_proof_bytes,
+            chain.chain_id.clone(),
+        )?;
         let verification = validate_verification(file.verification)?;
         let rpc = validate_rpc(&file.rpc)?;
         if p2p.enabled && runtime.shutdown_timeout <= p2p.proof_request_timeout {
@@ -250,15 +306,65 @@ impl Config {
                     .to_owned(),
             ));
         }
+        if p2p.enabled && !listener.enabled {
+            return Err(Error::InvalidConfig(
+                "listener.enabled must be true when P2P is enabled".to_owned(),
+            ));
+        }
 
         Ok(Self {
             runtime,
+            chain,
+            listener,
             proof_store,
             p2p,
             verification,
             rpc,
         })
     }
+}
+
+fn validate_chain(file: FileChainConfig, required: bool) -> Result<ChainConfig> {
+    let chain_id = file.chain_id.trim();
+    if required && chain_id.is_empty() {
+        return Err(Error::InvalidConfig(
+            "chain.chain_id must not be empty when Listener or P2P is enabled".to_owned(),
+        ));
+    }
+    HttpClient::new(file.comet_rpc_url.as_str()).map_err(|error| {
+        Error::InvalidConfig(format!("chain.comet_rpc_url is invalid: {error}"))
+    })?;
+    if file.request_timeout_secs == 0 {
+        return Err(Error::InvalidConfig(
+            "chain.request_timeout_secs must be greater than zero".to_owned(),
+        ));
+    }
+    Ok(ChainConfig {
+        chain_id: chain_id.to_owned(),
+        comet_rpc_url: file.comet_rpc_url,
+        request_timeout: Duration::from_secs(file.request_timeout_secs),
+    })
+}
+
+fn validate_listener(file: FileListenerConfig) -> Result<ListenerConfig> {
+    if file.reconnect_initial_backoff_millis == 0 || file.reconnect_max_backoff_secs == 0 {
+        return Err(Error::InvalidConfig(
+            "Listener reconnect backoffs must be greater than zero".to_owned(),
+        ));
+    }
+    let initial = Duration::from_millis(file.reconnect_initial_backoff_millis);
+    let maximum = Duration::from_secs(file.reconnect_max_backoff_secs);
+    if initial > maximum {
+        return Err(Error::InvalidConfig(
+            "listener.reconnect_initial_backoff_millis must not exceed reconnect_max_backoff_secs"
+                .to_owned(),
+        ));
+    }
+    Ok(ListenerConfig {
+        enabled: file.enabled,
+        reconnect_initial_backoff: initial,
+        reconnect_max_backoff: maximum,
+    })
 }
 
 fn validate_rpc(file: &FileRpcConfig) -> Result<RpcConfig> {
@@ -339,13 +445,12 @@ fn validate_proof_store(file: FileProofStoreConfig) -> Result<ProofStoreConfig> 
     })
 }
 
-fn validate_p2p(file: FileP2pConfig, max_proof_bytes: usize) -> Result<P2pConfig> {
+fn validate_p2p(
+    file: FileP2pConfig,
+    max_proof_bytes: usize,
+    chain_id: String,
+) -> Result<P2pConfig> {
     if file.enabled {
-        if file.chain_id.trim().is_empty() {
-            return Err(Error::InvalidConfig(
-                "p2p.chain_id must not be empty when P2P is enabled".to_owned(),
-            ));
-        }
         if file.listen_addresses.is_empty() {
             return Err(Error::InvalidConfig(
                 "p2p.listen_addresses must not be empty when P2P is enabled".to_owned(),
@@ -360,16 +465,7 @@ fn validate_p2p(file: FileP2pConfig, max_proof_bytes: usize) -> Result<P2pConfig
 
     let listen_addresses = parse_multiaddrs("p2p.listen_addresses", file.listen_addresses)?;
     let bootnodes = parse_multiaddrs("p2p.bootnodes", file.bootnodes)?;
-    let comet_rpc_url = Url::parse(&file.comet_rpc_url)
-        .map_err(|error| Error::InvalidConfig(format!("p2p.comet_rpc_url is invalid: {error}")))?;
-
-    if !matches!(comet_rpc_url.scheme(), "http" | "https") {
-        return Err(Error::InvalidConfig(
-            "p2p.comet_rpc_url must use http or https".to_owned(),
-        ));
-    }
-    if file.comet_rpc_timeout_secs == 0
-        || file.proof_request_timeout_secs == 0
+    if file.proof_request_timeout_secs == 0
         || file.max_availability_message_bytes == 0
         || file.command_buffer == 0
         || file.event_buffer == 0
@@ -382,12 +478,10 @@ fn validate_p2p(file: FileP2pConfig, max_proof_bytes: usize) -> Result<P2pConfig
 
     Ok(P2pConfig {
         enabled: file.enabled,
-        chain_id: file.chain_id,
+        chain_id,
         listen_addresses,
         bootnodes,
         validator_key_path: file.validator_key_path,
-        comet_rpc_url,
-        comet_rpc_timeout: Duration::from_secs(file.comet_rpc_timeout_secs),
         max_availability_message_bytes: file.max_availability_message_bytes,
         max_proof_bytes,
         proof_request_timeout: Duration::from_secs(file.proof_request_timeout_secs),
@@ -526,9 +620,14 @@ mod tests {
                 control_socket = "/tmp/control.sock"
                 shutdown_timeout_secs = 15
 
+                [chain]
+                chain_id = "pulsar-test"
+
+                [listener]
+                enabled = true
+
                 [p2p]
                 enabled = true
-                chain_id = "pulsar-test"
                 listen_addresses = ["/ip4/0.0.0.0/tcp/39000"]
                 validator_key_path = "/tmp/priv_validator_key.json"
             "#,
@@ -549,9 +648,14 @@ mod tests {
                 control_socket = "/tmp/control.sock"
                 shutdown_timeout_secs = 10
 
+                [chain]
+                chain_id = "pulsar-test"
+
+                [listener]
+                enabled = true
+
                 [p2p]
                 enabled = true
-                chain_id = "pulsar-test"
                 listen_addresses = ["/ip4/0.0.0.0/tcp/39000"]
                 validator_key_path = "/tmp/priv_validator_key.json"
                 proof_request_timeout_secs = 10
@@ -572,6 +676,9 @@ mod tests {
                 [runtime]
                 control_socket = "/tmp/control.sock"
                 shutdown_timeout_secs = 10
+
+                [listener]
+                enabled = true
 
                 [p2p]
                 enabled = true

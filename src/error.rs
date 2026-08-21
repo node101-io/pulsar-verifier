@@ -66,6 +66,15 @@ pub enum Error {
     #[error("P2P authorization error: {0}")]
     P2pAuthorization(String),
 
+    #[error("Pulsar chain client error: {0}")]
+    Chain(String),
+
+    #[error("Pulsar listener error: {0}")]
+    Listener(String),
+
+    #[error("local validator {0} is not in the active validator set")]
+    LocalValidatorRemoved(String),
+
     #[error("P2P protocol error: {0}")]
     P2pProtocol(String),
 

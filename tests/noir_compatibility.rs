@@ -109,7 +109,12 @@ fn fields(bytes: &[u8]) -> Result<Vec<Vec<u8>>, String> {
             bytes.len()
         ));
     }
-    Ok(bytes.chunks_exact(32).map(<[u8]>::to_vec).collect())
+    Ok(bytes
+        .as_chunks::<32>()
+        .0
+        .iter()
+        .map(|chunk| chunk.to_vec())
+        .collect())
 }
 
 async fn verify(

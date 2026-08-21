@@ -722,10 +722,10 @@ impl Driver {
                 if self.is_running() {
                     self.emit(DriverEvent::Listening { address }).await;
                 }
-                if self.pending_listeners.is_empty() {
-                    if let Some(ready) = self.ready.take() {
-                        let _ = ready.send(Ok(()));
-                    }
+                if self.pending_listeners.is_empty()
+                    && let Some(ready) = self.ready.take()
+                {
+                    let _ = ready.send(Ok(()));
                 }
             }
             SwarmEvent::ListenerError { listener_id, error } => {

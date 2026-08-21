@@ -2,9 +2,29 @@
 pub mod pulsarchain {
     pub mod verification {
         pub mod v1 {
-            #![allow(clippy::doc_markdown, clippy::must_use_candidate)]
+            #![allow(
+                clippy::default_trait_access,
+                clippy::doc_markdown,
+                clippy::missing_errors_doc,
+                clippy::must_use_candidate,
+                clippy::result_large_err,
+                clippy::too_many_lines
+            )]
 
             include!(concat!(env!("OUT_DIR"), "/pulsarchain.verification.v1.rs"));
+        }
+    }
+}
+
+/// Cosmos SDK pagination messages required by chain-owned query contracts.
+pub mod cosmos {
+    pub mod base {
+        pub mod query {
+            pub mod v1beta1 {
+                #![allow(clippy::doc_markdown, clippy::must_use_candidate)]
+
+                include!(concat!(env!("OUT_DIR"), "/cosmos.base.query.v1beta1.rs"));
+            }
         }
     }
 }
@@ -18,6 +38,7 @@ pub mod pulsar {
                 clippy::doc_markdown,
                 clippy::missing_errors_doc,
                 clippy::must_use_candidate,
+                clippy::result_large_err,
                 clippy::similar_names,
                 clippy::too_many_lines
             )]

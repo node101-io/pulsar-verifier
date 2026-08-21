@@ -1,0 +1,2 @@
+# Preserve pinned upstream protobuf source byte-for-byte, including whitespace.
+crates/pulsar-verifier-proto/proto/cosmos_proto/cosmos.proto whitespace=-trailing-space

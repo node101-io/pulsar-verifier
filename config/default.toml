@@ -18,5 +18,8 @@ retry_backoff_millis = 250
 enabled = true
 listen_address = "127.0.0.1:50051"
 
+[listener]
+enabled = false
+
 [p2p]
 enabled = false
