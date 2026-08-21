@@ -14,6 +14,10 @@ job_timeout_secs = 30
 max_retries = 2
 retry_backoff_millis = 250
 
+[rpc]
+enabled = true
+listen_address = "127.0.0.1:50051"
+
 [p2p]
 enabled = true
 chain_id = "pulsar-local-1"

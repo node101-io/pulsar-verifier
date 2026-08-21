@@ -18,11 +18,11 @@ Implemented:
 - Store lifecycle aligned with `QUEUED`, `VERIFYING`, `COMPLETED`, and `FAILED`
 - Tested request/response mapping for the chain verification service contract
 - Event-driven verification worker with configurable bounded concurrency and retries
+- Loopback-only chain-facing gRPC server with standard health reporting
 - A pinned Noir/Barretenberg 5.2.0 compatibility fixture
 
 Not yet implemented:
 
-- Running gRPC servers
 - The production Noir backend
 - Pulsar block/event listener and restart reconciliation
 - Consumer submission RPC and Cosmos transaction relay
@@ -46,6 +46,11 @@ Both commands default to `config/default.toml`. `run` handles `Ctrl-C`, `SIGTERM
 and the control socket through the same shutdown path. P2P is disabled in the
 development config; `config/local.toml.example` shows the validator credentials,
 CometBFT endpoint, and listeners required to enable it.
+
+The packaged development config serves the chain-facing verification API on
+`127.0.0.1:50051`. Config files that omit `[rpc]` keep the server disabled. This
+phase intentionally accepts only literal loopback listeners because the RPC is
+plaintext and unauthenticated.
 
 ## Verification Contract
 
@@ -88,6 +93,8 @@ The chain-facing result contract deliberately separates:
 
 Only completed verdicts are returned by the consensus-facing
 `GetVerificationResults` method. `GetProofStatuses` exposes local diagnostics.
+Both methods are available through the generated Tonic service with the chain's
+fixed 256 KiB message budget and standard gRPC health reporting.
 
 ## Proof Store
 

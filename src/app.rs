@@ -8,6 +8,7 @@ use crate::{
     config::Config,
     control::ControlServer,
     p2p::{P2pExit, P2pService},
+    rpc::{RpcExit, RpcServer},
     store::ProofStore,
     verification::{VerificationWorker, VerifierRegistry},
 };
@@ -37,52 +38,40 @@ impl App {
         let mut verification_task = Some(tokio::spawn(
             verification_worker.run(verification_stop.clone()),
         ));
-
-        // TODO: Start the RPC server with a child cancellation token.
+        let mut rpc = if config.rpc.enabled {
+            match RpcServer::start(config.rpc, Arc::clone(&proof_store)).await {
+                Ok(server) => Some(server),
+                Err(error) => {
+                    if let Some(service) = p2p.take() {
+                        service.force_shutdown().await;
+                    }
+                    verification_stop.cancel();
+                    abort_task(&mut verification_task).await;
+                    return Err(error);
+                }
+            }
+        } else {
+            None
+        };
 
         tracing::info!(
             socket = %config.runtime.control_socket.display(),
             "pulsar verifier started"
         );
 
-        let exit = tokio::select! {
-            result = control.wait_for_shutdown() => {
-                tracing::info!("shutdown requested through control socket");
-                AppExit::Requested(result)
-            }
-            result = wait_for_signal() => {
-                tracing::info!("shutdown requested by process signal");
-                AppExit::Requested(result)
-            }
-            task = wait_for_p2p_exit(&mut p2p) => {
-                AppExit::P2pTask(task)
-            }
-            task = wait_for_verification_exit(&mut verification_task) => {
-                AppExit::VerificationTask(task)
-            }
-        };
+        let exit = wait_for_app_exit(&control, &mut p2p, &mut verification_task, &mut rpc).await;
 
         let runtime_result = match exit {
             AppExit::Requested(request_result) => {
-                let deadline = Instant::now() + config.runtime.shutdown_timeout;
-                let mut first_error = request_result.err();
-                if let Some(service) = p2p.take() {
-                    preserve_first_error(
-                        &mut first_error,
-                        shutdown_p2p(service, deadline, config.runtime.shutdown_timeout).await,
-                    );
-                }
-                preserve_first_error(
-                    &mut first_error,
-                    shutdown_verification(
-                        &verification_stop,
-                        &mut verification_task,
-                        deadline,
-                        config.runtime.shutdown_timeout,
-                    )
-                    .await,
-                );
-                first_error.map_or(Ok(()), Err)
+                shutdown_requested(
+                    request_result,
+                    &mut p2p,
+                    &mut rpc,
+                    &verification_stop,
+                    &mut verification_task,
+                    config.runtime.shutdown_timeout,
+                )
+                .await
             }
             AppExit::P2pTask(task) => {
                 let error = task.into_error();
@@ -91,6 +80,9 @@ impl App {
                 }
                 verification_stop.cancel();
                 abort_task(&mut verification_task).await;
+                if let Some(server) = rpc.take() {
+                    server.force_shutdown().await;
+                }
                 Err(error)
             }
             AppExit::VerificationTask(task) => {
@@ -99,6 +91,18 @@ impl App {
                 if let Some(service) = p2p.take() {
                     service.force_shutdown().await;
                 }
+                if let Some(server) = rpc.take() {
+                    server.force_shutdown().await;
+                }
+                Err(error)
+            }
+            AppExit::RpcTask(task) => {
+                let error = task.into_error();
+                if let Some(service) = p2p.take() {
+                    service.force_shutdown().await;
+                }
+                verification_stop.cancel();
+                abort_task(&mut verification_task).await;
                 Err(error)
             }
         };
@@ -110,10 +114,78 @@ impl App {
     }
 }
 
+async fn wait_for_app_exit(
+    control: &ControlServer,
+    p2p: &mut Option<P2pService>,
+    verification_task: &mut Option<JoinHandle<Result<()>>>,
+    rpc: &mut Option<RpcServer>,
+) -> AppExit {
+    tokio::select! {
+        result = control.wait_for_shutdown() => {
+            tracing::info!("shutdown requested through control socket");
+            AppExit::Requested(result)
+        }
+        result = wait_for_signal() => {
+            tracing::info!("shutdown requested by process signal");
+            AppExit::Requested(result)
+        }
+        task = wait_for_p2p_exit(p2p) => AppExit::P2pTask(task),
+        task = wait_for_verification_exit(verification_task) => AppExit::VerificationTask(task),
+        task = wait_for_rpc_exit(rpc) => AppExit::RpcTask(task),
+    }
+}
+
+async fn shutdown_requested(
+    request_result: Result<()>,
+    p2p: &mut Option<P2pService>,
+    rpc: &mut Option<RpcServer>,
+    verification_stop: &CancellationToken,
+    verification_task: &mut Option<JoinHandle<Result<()>>>,
+    shutdown_timeout: Duration,
+) -> Result<()> {
+    let deadline = Instant::now() + shutdown_timeout;
+    let mut first_error = request_result.err();
+    if let Some(server) = rpc.as_mut() {
+        server.mark_not_serving().await;
+    }
+    // TODO: Stop future Listener and consumer-RPC producers before P2P drain.
+    if let Some(service) = p2p.take() {
+        preserve_first_error(
+            &mut first_error,
+            shutdown_p2p(service, deadline, shutdown_timeout).await,
+        );
+    }
+    preserve_first_error(
+        &mut first_error,
+        shutdown_verification(
+            verification_stop,
+            verification_task,
+            deadline,
+            shutdown_timeout,
+        )
+        .await,
+    );
+    if let Some(server) = rpc.take() {
+        preserve_first_error(
+            &mut first_error,
+            shutdown_rpc(server, deadline, shutdown_timeout).await,
+        );
+    }
+    first_error.map_or(Ok(()), Err)
+}
+
 enum AppExit {
     Requested(Result<()>),
     P2pTask(P2pExit),
     VerificationTask(std::result::Result<Result<()>, tokio::task::JoinError>),
+    RpcTask(RpcExit),
+}
+
+async fn wait_for_rpc_exit(server: &mut Option<RpcServer>) -> RpcExit {
+    match server {
+        Some(server) => server.wait_for_exit().await,
+        None => std::future::pending().await,
+    }
 }
 
 async fn wait_for_p2p_exit(service: &mut Option<P2pService>) -> P2pExit {
@@ -141,6 +213,20 @@ async fn shutdown_p2p(
         return Err(Error::ShutdownTimeout(total_timeout));
     };
     service
+        .shutdown(remaining)
+        .await
+        .map_err(|error| match error {
+            Error::ShutdownTimeout(_) => Error::ShutdownTimeout(total_timeout),
+            error => error,
+        })
+}
+
+async fn shutdown_rpc(server: RpcServer, deadline: Instant, total_timeout: Duration) -> Result<()> {
+    let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
+        server.force_shutdown().await;
+        return Err(Error::ShutdownTimeout(total_timeout));
+    };
+    server
         .shutdown(remaining)
         .await
         .map_err(|error| match error {
@@ -230,7 +316,7 @@ mod tests {
 
     use super::*;
     use crate::{
-        config::{P2pConfig, ProofStoreConfig, RuntimeConfig, VerificationConfig},
+        config::{P2pConfig, ProofStoreConfig, RpcConfig, RuntimeConfig, VerificationConfig},
         control::request_shutdown,
     };
 
@@ -250,6 +336,7 @@ mod tests {
                 max_retries: 0,
                 retry_backoff: Duration::ZERO,
             },
+            rpc: RpcConfig::disabled(),
         };
         let client_config = config.runtime.clone();
 

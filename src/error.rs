@@ -1,4 +1,4 @@
-use std::{io, path::PathBuf, time::Duration};
+use std::{io, net::SocketAddr, path::PathBuf, time::Duration};
 
 use thiserror::Error;
 
@@ -117,4 +117,14 @@ pub enum Error {
 
     #[error("invalid verification service request: {0}")]
     InvalidVerificationRequest(String),
+
+    #[error("failed to bind verification RPC server on {address}: {source}")]
+    RpcBind {
+        address: SocketAddr,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("verification RPC server failed: {0}")]
+    RpcServer(#[source] tonic::transport::Error),
 }

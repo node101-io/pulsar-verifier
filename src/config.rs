@@ -1,5 +1,6 @@
 use std::{
     fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
@@ -17,6 +18,24 @@ pub struct Config {
     pub proof_store: ProofStoreConfig,
     pub p2p: P2pConfig,
     pub verification: VerificationConfig,
+    pub rpc: RpcConfig,
+}
+
+/// Loopback-only chain-facing gRPC server settings.
+#[derive(Debug, Clone, Copy)]
+pub struct RpcConfig {
+    pub enabled: bool,
+    pub listen_address: SocketAddr,
+}
+
+impl RpcConfig {
+    #[cfg(test)]
+    pub(crate) fn disabled() -> Self {
+        Self {
+            enabled: false,
+            listen_address: "127.0.0.1:50051".parse().expect("valid test address"),
+        }
+    }
 }
 
 /// Resource limits for asynchronous proof verification jobs.
@@ -87,6 +106,24 @@ struct FileConfig {
     p2p: FileP2pConfig,
     #[serde(default)]
     verification: FileVerificationConfig,
+    #[serde(default)]
+    rpc: FileRpcConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileRpcConfig {
+    enabled: bool,
+    listen_address: String,
+}
+
+impl Default for FileRpcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_address: "127.0.0.1:50051".to_owned(),
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -206,6 +243,7 @@ impl Config {
         let proof_store = validate_proof_store(file.proof_store)?;
         let p2p = validate_p2p(file.p2p, proof_store.max_proof_bytes)?;
         let verification = validate_verification(file.verification)?;
+        let rpc = validate_rpc(&file.rpc)?;
         if p2p.enabled && runtime.shutdown_timeout <= p2p.proof_request_timeout {
             return Err(Error::InvalidConfig(
                 "runtime.shutdown_timeout_secs must be greater than p2p.proof_request_timeout_secs when P2P is enabled"
@@ -218,8 +256,31 @@ impl Config {
             proof_store,
             p2p,
             verification,
+            rpc,
         })
     }
+}
+
+fn validate_rpc(file: &FileRpcConfig) -> Result<RpcConfig> {
+    let listen_address = file.listen_address.parse::<SocketAddr>().map_err(|error| {
+        Error::InvalidConfig(format!(
+            "rpc.listen_address must be a literal IP and port: {error}"
+        ))
+    })?;
+    if file.enabled && listen_address.port() == 0 {
+        return Err(Error::InvalidConfig(
+            "rpc.listen_address port must be greater than zero when RPC is enabled".to_owned(),
+        ));
+    }
+    if file.enabled && !listen_address.ip().is_loopback() {
+        return Err(Error::InvalidConfig(
+            "rpc.listen_address must use a loopback IP when RPC is enabled".to_owned(),
+        ));
+    }
+    Ok(RpcConfig {
+        enabled: file.enabled,
+        listen_address,
+    })
 }
 
 fn validate_verification(file: FileVerificationConfig) -> Result<VerificationConfig> {
@@ -393,6 +454,11 @@ mod tests {
             config.verification.retry_backoff,
             Duration::from_millis(250)
         );
+        assert!(!config.rpc.enabled);
+        assert_eq!(
+            config.rpc.listen_address,
+            "127.0.0.1:50051".parse().unwrap()
+        );
     }
 
     #[test]
@@ -557,6 +623,53 @@ mod tests {
 
                     [verification]
                     {verification}
+                "#,
+            ));
+
+            assert!(matches!(
+                Config::from_file(file.path()),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn loads_enabled_loopback_rpc() {
+        let file = config_file(
+            r#"
+                [runtime]
+                control_socket = "/tmp/control.sock"
+                shutdown_timeout_secs = 10
+
+                [rpc]
+                enabled = true
+                listen_address = "[::1]:50051"
+            "#,
+        );
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert!(config.rpc.enabled);
+        assert!(config.rpc.listen_address.ip().is_loopback());
+    }
+
+    #[test]
+    fn rejects_unsafe_or_malformed_rpc_addresses() {
+        for address in [
+            "0.0.0.0:50051",
+            "192.168.1.10:50051",
+            "127.0.0.1:0",
+            "localhost:50051",
+            "127.0.0.1",
+        ] {
+            let file = config_file(&format!(
+                r#"
+                    [runtime]
+                    control_socket = "/tmp/control.sock"
+                    shutdown_timeout_secs = 10
+
+                    [rpc]
+                    enabled = true
+                    listen_address = "{address}"
                 "#,
             ));
 
