@@ -120,7 +120,7 @@ impl P2pService {
                 self.driver_task.take();
                 P2pExit { task: DRIVER_TASK, result }
             }
-            result = worker => {
+            result = &mut *worker => {
                 self.worker_task.take();
                 P2pExit { task: WORKER_TASK, result }
             }
@@ -180,11 +180,17 @@ impl P2pService {
             .ok_or(Error::TaskExitedUnexpectedly(WORKER_TASK))?;
 
         tokio::select! {
-            result = worker => {
+            result = &mut *worker => {
                 self.worker_task.take();
-                task_result(result)
+                if matches!(result, Ok(Err(Error::P2pDriverClosed))) {
+                    let result = driver.await;
+                    self.driver_task.take();
+                    Err(P2pExit { task: DRIVER_TASK, result }.into_error())
+                } else {
+                    task_result(result)
+                }
             }
-            result = driver => {
+            result = &mut *driver => {
                 self.driver_task.take();
                 Err(P2pExit { task: DRIVER_TASK, result }.into_error())
             }

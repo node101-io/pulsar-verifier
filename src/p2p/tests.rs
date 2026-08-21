@@ -1043,7 +1043,7 @@ async fn worker_limits_two_hundred_fifty_six_retrievals_to_sixteen_requests() {
     let client_store = Arc::new(ProofStore::new(ProofStoreConfig::test_default()).unwrap());
     let mut config = test_config("/ip4/127.0.0.1/tcp/0".parse().unwrap());
     config.max_concurrent_retrievals = CONCURRENCY;
-    config.retrieval_timeout = Duration::from_secs(120);
+    config.retrieval_timeout = Duration::from_millis(500);
     let client = StoreBackedNode::start_with_config(
         client_identity,
         authorized,
@@ -1106,6 +1106,9 @@ async fn worker_limits_two_hundred_fifty_six_retrievals_to_sixteen_requests() {
     })
     .await;
     assert!(seventeenth.is_err());
+
+    // Queue time must not consume the first transfer attempt's timeout budget.
+    tokio::time::sleep(Duration::from_millis(600)).await;
 
     let mut completed = 0;
     while completed < PROOF_COUNT {

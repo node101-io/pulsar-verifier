@@ -23,7 +23,8 @@ use crate::{
 use super::{DriverClient, DriverEvent, ProofRequestId, QueryId};
 
 struct RetrievalState {
-    deadline: Instant,
+    discovery_deadline: Option<Instant>,
+    transfer_deadline: Option<Instant>,
     attempted: HashSet<PeerId>,
     active: Option<(ProofRequestId, PeerId)>,
     query: Option<QueryId>,
@@ -310,7 +311,8 @@ impl Worker {
         self.retrievals
             .entry(verification_id)
             .or_insert_with(|| RetrievalState {
-                deadline: Instant::now() + self.retrieval_timeout,
+                discovery_deadline: None,
+                transfer_deadline: None,
                 attempted: HashSet::new(),
                 active: None,
                 query: None,
@@ -346,10 +348,6 @@ impl Worker {
             if state.finished || state.active.is_some() {
                 continue;
             }
-            if Instant::now() >= state.deadline {
-                self.stop_retrieval(verification_id);
-                continue;
-            }
             self.try_retrieve(verification_id).await?;
         }
         Ok(())
@@ -367,6 +365,15 @@ impl Worker {
             providers.shuffle(&mut rand::rng());
 
             if let Some(peer) = providers.pop() {
+                if self
+                    .retrievals
+                    .get(&verification_id)
+                    .and_then(|state| state.transfer_deadline)
+                    .is_some_and(|deadline| Instant::now() >= deadline)
+                {
+                    self.stop_retrieval(verification_id);
+                    return Ok(());
+                }
                 if self.active_retrievals >= self.max_concurrent_retrievals {
                     self.enqueue(verification_id);
                     return Ok(());
@@ -376,6 +383,9 @@ impl Worker {
                         let Some(state) = self.retrievals.get_mut(&verification_id) else {
                             return Ok(());
                         };
+                        state
+                            .transfer_deadline
+                            .get_or_insert_with(|| Instant::now() + self.retrieval_timeout);
                         state.query = None;
                         state.timer_generation = state.timer_generation.wrapping_add(1);
                         state.active = Some((request_id, peer));
@@ -404,9 +414,21 @@ impl Worker {
             {
                 return Ok(());
             }
+            if self
+                .retrievals
+                .get(&verification_id)
+                .and_then(active_deadline)
+                .is_some_and(|deadline| Instant::now() >= deadline)
+            {
+                self.stop_retrieval(verification_id);
+                return Ok(());
+            }
             match self.driver.query_availability(verification_id).await {
                 Ok(query_id) => {
                     if let Some(state) = self.retrievals.get_mut(&verification_id) {
+                        state
+                            .discovery_deadline
+                            .get_or_insert_with(|| Instant::now() + self.retrieval_timeout);
                         state.query = Some(query_id);
                     }
                     self.schedule_retry(verification_id);
@@ -427,7 +449,9 @@ impl Worker {
             self.retrieval_max_backoff,
             state.retry_round,
         );
-        let remaining = state.deadline.saturating_duration_since(Instant::now());
+        let remaining = active_deadline(state)
+            .expect("scheduled retrieval retry has an active deadline")
+            .saturating_duration_since(Instant::now());
         let delay = full_jitter(cap, remaining);
         state.retry_round = state.retry_round.saturating_add(1);
         state.timer_generation = state.timer_generation.wrapping_add(1);
@@ -452,7 +476,7 @@ impl Worker {
             return Ok(());
         }
         state.query = None;
-        if Instant::now() >= state.deadline {
+        if active_deadline(state).is_some_and(|deadline| Instant::now() >= deadline) {
             self.stop_retrieval(wake.verification_id);
             return Ok(());
         }
@@ -485,7 +509,10 @@ impl Worker {
             .active_retrievals
             .checked_sub(1)
             .expect("tracked proof request owns one retrieval slot");
-        if succeeded || state.finished || Instant::now() >= state.deadline {
+        if succeeded
+            || state.finished
+            || active_deadline(state).is_some_and(|deadline| Instant::now() >= deadline)
+        {
             self.retrievals.remove(&verification_id);
         } else {
             state.attempted.insert(peer);
@@ -532,6 +559,10 @@ impl Worker {
         }
         Ok(())
     }
+}
+
+fn active_deadline(state: &RetrievalState) -> Option<Instant> {
+    state.transfer_deadline.or(state.discovery_deadline)
 }
 
 fn retry_cap(initial: Duration, maximum: Duration, round: u32) -> Duration {
