@@ -8,6 +8,7 @@ license = "Apache-2.0"
 
 [dependencies]
 prost = "0.13"
+prost-types = "0.13"
 tonic = "0.12"
 
 [build-dependencies]

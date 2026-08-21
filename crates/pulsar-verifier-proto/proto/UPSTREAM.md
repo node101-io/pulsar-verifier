@@ -7,6 +7,7 @@ The chain-owned contracts are copied without modification from
 - `pulsarchain/verification/v1/types.proto`
 - `pulsarchain/verification/v1/params.proto`
 - `pulsarchain/verification/v1/query.proto`
+- `pulsarchain/verification/v1/tx.proto`
 - `pulsar/verifier/v1/verification_service.proto`
 
 Their custom option dependencies are pinned to the same revisions recorded in
@@ -19,6 +20,8 @@ that commit's `buf.lock`:
 - `google/protobuf/descriptor.proto`: exported transitively with the pinned
   Gogo proto contract
 - `cosmos/base/query/v1beta1/pagination.proto`: Cosmos SDK commit
+  `65fa41963e6a41dd95a35934239029df`
+- `cosmos/{base,crypto,msg,tx}/...`: Cosmos SDK commit
   `65fa41963e6a41dd95a35934239029df`
 - `cosmos_proto/cosmos.proto`: Cosmos Proto commit
   `04467658e59e44bbb22fe568206e1f70`

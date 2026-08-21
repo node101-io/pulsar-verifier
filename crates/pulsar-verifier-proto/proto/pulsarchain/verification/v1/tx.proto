@@ -1,0 +1,57 @@
+syntax = "proto3";
+package pulsarchain.verification.v1;
+
+import "amino/amino.proto";
+import "cosmos/msg/v1/msg.proto";
+import "cosmos_proto/cosmos.proto";
+import "gogoproto/gogo.proto";
+import "pulsarchain/verification/v1/params.proto";
+import "pulsarchain/verification/v1/types.proto";
+
+option go_package = "github.com/node101-io/pulsar-chain/x/verification/types";
+
+// Msg defines the public verification module transactions. Validator
+// commitments and revelations are authenticated vote-extension actions and
+// intentionally have no Msg RPC.
+service Msg {
+  option (cosmos.msg.v1.service) = true;
+
+  // SubmitProof registers one content-addressed verification request.
+  rpc SubmitProof(MsgSubmitProof) returns (MsgSubmitProofResponse);
+  // UpdateParams updates governance-controlled parameters.
+  rpc UpdateParams(MsgUpdateParams) returns (MsgUpdateParamsResponse);
+}
+
+// MsgSubmitProof registers the component hashes and verifier family from which
+// the chain derives the canonical verification ID.
+message MsgSubmitProof {
+  option (cosmos.msg.v1.signer) = "signer";
+  option (amino.name) = "pulsarchain/x/verification/MsgSubmitProof";
+
+  string signer = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  bytes proof_hash = 2;
+  ProofType proof_type = 3;
+  bytes public_inputs_hash = 4;
+  bytes verification_key_hash = 5;
+}
+
+// MsgSubmitProofResponse returns the deterministic proof key.
+message MsgSubmitProofResponse {
+  uint64 submission_height = 1;
+  uint32 index_in_block = 2;
+}
+
+// MsgUpdateParams updates verification parameters through module authority.
+message MsgUpdateParams {
+  option (cosmos.msg.v1.signer) = "authority";
+  option (amino.name) = "pulsarchain/x/verification/MsgUpdateParams";
+
+  string authority = 1 [(cosmos_proto.scalar) = "cosmos.AddressString"];
+  Params params = 2 [
+    (gogoproto.nullable) = false,
+    (amino.dont_omitempty) = true
+  ];
+}
+
+// MsgUpdateParamsResponse confirms parameter update.
+message MsgUpdateParamsResponse {}

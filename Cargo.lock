@@ -2876,6 +2876,7 @@ dependencies = [
  "moka",
  "nix",
  "prost 0.13.5",
+ "prost-types",
  "pulsar-verifier-proto",
  "rand 0.9.5",
  "rmp-serde",
@@ -2902,6 +2903,7 @@ version = "0.1.0"
 dependencies = [
  "prost 0.13.5",
  "prost-build",
+ "prost-types",
  "protoc-bin-vendored",
  "tonic",
  "tonic-build",

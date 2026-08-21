@@ -69,6 +69,26 @@ pub enum Error {
     #[error("Pulsar chain client error: {0}")]
     Chain(String),
 
+    #[error("invalid proof submission: {0}")]
+    InvalidSubmission(String),
+
+    #[error("transaction is {actual_bytes} bytes; maximum is {max_bytes}")]
+    TransactionTooLarge {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
+
+    #[error("transaction {transaction_hash} was rejected by CheckTx ({codespace}:{code}): {log}")]
+    CheckTxRejected {
+        transaction_hash: String,
+        codespace: String,
+        code: u32,
+        log: String,
+    },
+
+    #[error("CometBFT returned an unexpected transaction hash")]
+    TransactionHashMismatch,
+
     #[error("CometBFT chain ID mismatch: expected {expected}, got {actual}")]
     ChainIdMismatch { expected: String, actual: String },
 

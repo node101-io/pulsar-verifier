@@ -19,12 +19,47 @@ pub mod pulsarchain {
 /// Cosmos SDK pagination messages required by chain-owned query contracts.
 pub mod cosmos {
     pub mod base {
+        pub mod v1beta1 {
+            #![allow(clippy::doc_markdown, clippy::must_use_candidate)]
+
+            include!(concat!(env!("OUT_DIR"), "/cosmos.base.v1beta1.rs"));
+        }
+
         pub mod query {
             pub mod v1beta1 {
                 #![allow(clippy::doc_markdown, clippy::must_use_candidate)]
 
                 include!(concat!(env!("OUT_DIR"), "/cosmos.base.query.v1beta1.rs"));
             }
+        }
+    }
+
+    pub mod crypto {
+        pub mod multisig {
+            pub mod v1beta1 {
+                #![allow(clippy::doc_markdown, clippy::must_use_candidate)]
+
+                include!(concat!(
+                    env!("OUT_DIR"),
+                    "/cosmos.crypto.multisig.v1beta1.rs"
+                ));
+            }
+        }
+    }
+
+    pub mod tx {
+        pub mod signing {
+            pub mod v1beta1 {
+                #![allow(clippy::doc_markdown, clippy::must_use_candidate)]
+
+                include!(concat!(env!("OUT_DIR"), "/cosmos.tx.signing.v1beta1.rs"));
+            }
+        }
+
+        pub mod v1beta1 {
+            #![allow(clippy::doc_markdown, clippy::must_use_candidate)]
+
+            include!(concat!(env!("OUT_DIR"), "/cosmos.tx.v1beta1.rs"));
         }
     }
 }

@@ -1,5 +1,6 @@
 use std::{collections::HashSet, fmt, time::Duration};
 
+use bytes::Bytes;
 use futures::StreamExt as _;
 use prost::Message as _;
 use pulsar_verifier_proto::{
@@ -23,6 +24,16 @@ const MAX_PROOFS_PER_BLOCK: usize = 256;
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(crate) struct ChainStatus {
     pub(crate) latest_height: u64,
+}
+
+/// Immediate `CheckTx` receipt returned by `CometBFT`'s synchronous broadcast.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub(crate) struct BroadcastReceipt {
+    pub(crate) transaction_hash: [u8; 32],
+    pub(crate) code: u32,
+    pub(crate) codespace: String,
+    pub(crate) log: String,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -138,6 +149,28 @@ impl PulsarClient {
         }
         Ok(ChainStatus {
             latest_height: status.sync_info.latest_block_height.value(),
+        })
+    }
+
+    /// Relays an already signed Cosmos transaction and returns its `CheckTx` result.
+    #[allow(dead_code)]
+    pub(crate) async fn broadcast_tx_sync(&self, tx_raw: Bytes) -> Result<BroadcastReceipt> {
+        let response = self
+            .with_timeout(
+                "broadcast_tx_sync",
+                self.http.broadcast_tx_sync(tx_raw.to_vec()),
+            )
+            .await?;
+        let transaction_hash = response
+            .hash
+            .as_bytes()
+            .try_into()
+            .map_err(|_| Error::Chain("transaction hash must contain 32 bytes".to_owned()))?;
+        Ok(BroadcastReceipt {
+            transaction_hash,
+            code: response.code.value(),
+            codespace: bounded_text(response.codespace, 64),
+            log: bounded_text(response.log, 512),
         })
     }
 
@@ -436,6 +469,19 @@ fn websocket_url(http_url: &str) -> Result<String> {
 
 fn chain_error(error: impl fmt::Display) -> Error {
     Error::Chain(error.to_string())
+}
+
+#[allow(dead_code)]
+fn bounded_text(mut value: String, max_bytes: usize) -> String {
+    if value.len() <= max_bytes {
+        return value;
+    }
+    let mut boundary = max_bytes;
+    while !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    value.truncate(boundary);
+    value
 }
 
 #[cfg(test)]
