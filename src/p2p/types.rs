@@ -67,6 +67,7 @@ pub(super) enum DriverEvent {
     ProofRequestFailed {
         request_id: ProofRequestId,
         peer: PeerId,
+        verification_id: VerificationId,
         reason: String,
     },
 }

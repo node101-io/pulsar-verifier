@@ -29,3 +29,7 @@ enabled = false
 
 [p2p]
 enabled = false
+max_concurrent_retrievals = 16
+retrieval_timeout_secs = 30
+retrieval_initial_backoff_millis = 250
+retrieval_max_backoff_secs = 2

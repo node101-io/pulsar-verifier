@@ -49,15 +49,13 @@ pub(super) struct DriverClient {
     commands: mpsc::Sender<DriverCommand>,
 }
 
-// TODO: Remove this allowance as proof retrieval and validator refresh consume
-// the remaining private command surface.
-#[allow(dead_code)]
 impl DriverClient {
     /// Dials an already authorized peer using all known transport addresses.
     ///
     /// # Errors
     ///
     /// Returns an error if the driver is unavailable or rejects the dial.
+    #[cfg(test)]
     pub(super) async fn dial(&self, peer: PeerId, addresses: Vec<Multiaddr>) -> Result<()> {
         self.call(|reply| DriverCommand::Dial {
             peer,
@@ -203,8 +201,8 @@ impl DriverClient {
     }
 }
 
-#[allow(dead_code)]
 enum DriverCommand {
+    #[cfg(test)]
     Dial {
         peer: PeerId,
         addresses: Vec<Multiaddr>,
@@ -423,6 +421,7 @@ impl Driver {
 
     fn handle_command(&mut self, command: DriverCommand) -> bool {
         match command {
+            #[cfg(test)]
             DriverCommand::Dial {
                 peer,
                 addresses,
@@ -503,6 +502,7 @@ impl Driver {
         false
     }
 
+    #[cfg(test)]
     fn dial(&mut self, peer: PeerId, addresses: Vec<Multiaddr>) -> Result<()> {
         self.require_running()?;
         if !self.authorized_peers.contains(&peer) {
@@ -547,11 +547,18 @@ impl Driver {
         self.require_running()?;
         let query_id = QueryId::random();
         let bytes = availability::query(&self.config.chain_id, query_id, verification_id);
-        self.swarm
+        let published = self
+            .swarm
             .behaviour_mut()
             .gossipsub
-            .publish(self.topic.clone(), bytes)
-            .map_err(|error| Error::P2pDriver(format!("failed to publish query: {error}")))?;
+            .publish(self.topic.clone(), bytes);
+        if let Err(error) = published
+            && !matches!(error, gossipsub::PublishError::NoPeersSubscribedToTopic)
+        {
+            return Err(Error::P2pDriver(format!(
+                "failed to publish query: {error}"
+            )));
+        }
         self.outstanding_queries
             .insert(query_id, (verification_id, Instant::now()));
         Ok(query_id)
@@ -898,9 +905,12 @@ impl Driver {
                 if let Some(request) = self.outbound_requests.remove(&request_id) {
                     self.in_flight
                         .remove(&(request.peer, request.verification_id));
+                    self.availability
+                        .remove_provider(request.verification_id, request.peer);
                     self.emit(DriverEvent::ProofRequestFailed {
                         request_id: request.application_id,
                         peer,
+                        verification_id: request.verification_id,
                         reason: error.to_string(),
                     })
                     .await;
@@ -1021,9 +1031,12 @@ impl Driver {
     }
 
     async fn emit_failed(&mut self, request: &OutboundProofRequest, reason: &str) {
+        self.availability
+            .remove_provider(request.verification_id, request.peer);
         self.emit(DriverEvent::ProofRequestFailed {
             request_id: request.application_id,
             peer: request.peer,
+            verification_id: request.verification_id,
             reason: reason.to_owned(),
         })
         .await;

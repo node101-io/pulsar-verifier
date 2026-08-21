@@ -66,7 +66,7 @@ impl P2pService {
             events,
             ready,
         } = Driver::build(config.clone(), identity, authorized_peers)?;
-        let worker = Worker::new(client.clone(), events, store);
+        let worker = Worker::new(client.clone(), events, store, local_peer_id, config);
         let worker_stop = CancellationToken::new();
         let driver_task = tokio::spawn(driver.run());
         let worker_task = tokio::spawn(worker.run(worker_stop.clone()));
@@ -368,7 +368,7 @@ mod tests {
             events,
             ready,
         } = Driver::build(config.clone(), identity, HashSet::from([local_peer])).unwrap();
-        let worker = Worker::new(client.clone(), events, store);
+        let worker = Worker::new(client.clone(), events, store, local_peer, &config);
         let worker_stop = CancellationToken::new();
         let driver_task = tokio::spawn(driver.run());
         let worker_dropped = Arc::new(AtomicBool::new(false));
@@ -419,6 +419,10 @@ mod tests {
             max_availability_message_bytes: 64 * 1024,
             max_proof_bytes: 8 * 1024 * 1024,
             proof_request_timeout: Duration::from_secs(1),
+            max_concurrent_retrievals: 4,
+            retrieval_timeout: Duration::from_secs(2),
+            retrieval_initial_backoff: Duration::from_millis(10),
+            retrieval_max_backoff: Duration::from_millis(100),
             command_buffer: 32,
             event_buffer: 32,
         }

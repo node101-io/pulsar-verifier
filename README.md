@@ -23,12 +23,12 @@ Implemented:
 - Validator authorization refresh driven by committed `validators_hash` changes
 - Loopback consumer submission RPC with proof-to-transaction binding validation
 - Store-first signed Cosmos transaction relay through local CometBFT `CheckTx`
+- Automatic bounded proof retrieval after committed chain observation
 - A pinned Noir/Barretenberg 5.2.0 compatibility fixture
 
 Not yet implemented:
 
 - The production Noir backend
-- Automatic P2P retrieval after an on-chain observation
 
 ## CLI
 
@@ -177,12 +177,21 @@ Worker, and their task lifecycle. The current network provides:
 - Startup validator authorization from CometBFT
 - Signed GossipSub availability announcements and provider queries
 - Direct transfer of the complete composite `Proof`
+- Automatic provider discovery, randomized fallback, and bounded retries
 - Ordered drain of accepted proof exchanges during shutdown
 
 Availability is keyed by `VerificationId`. A downloaded proof is accepted only
 after recomputing the identifier and only when that ID was already observed
 on-chain. BLAKE3 is used solely for GossipSub message deduplication, not proof
 identity.
+
+When the Listener observes an ID without local content, the Worker first tries
+known providers and otherwise publishes an availability query. Retrieval is
+single-flight per ID, globally limited to 16 active downloads by default, and
+uses full-jitter backoff within a 30-second attempt window. Failure leaves the
+chain-facing state `Unavailable`; a later provider announcement can start a new
+attempt. Retrieval scheduling is process-local and is rebuilt from the Store's
+waiting-content snapshot after restart or subscriber lag.
 
 ## Noir Compatibility
 

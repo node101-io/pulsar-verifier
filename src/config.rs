@@ -114,6 +114,10 @@ pub struct P2pConfig {
     pub max_availability_message_bytes: usize,
     pub max_proof_bytes: usize,
     pub proof_request_timeout: Duration,
+    pub max_concurrent_retrievals: usize,
+    pub retrieval_timeout: Duration,
+    pub retrieval_initial_backoff: Duration,
+    pub retrieval_max_backoff: Duration,
     pub command_buffer: usize,
     pub event_buffer: usize,
 }
@@ -282,6 +286,10 @@ struct FileP2pConfig {
     validator_key_path: PathBuf,
     max_availability_message_bytes: usize,
     proof_request_timeout_secs: u64,
+    max_concurrent_retrievals: usize,
+    retrieval_timeout_secs: u64,
+    retrieval_initial_backoff_millis: u64,
+    retrieval_max_backoff_secs: u64,
     command_buffer: usize,
     event_buffer: usize,
 }
@@ -295,6 +303,10 @@ impl Default for FileP2pConfig {
             validator_key_path: PathBuf::new(),
             max_availability_message_bytes: 64 * 1024,
             proof_request_timeout_secs: 10,
+            max_concurrent_retrievals: 16,
+            retrieval_timeout_secs: 30,
+            retrieval_initial_backoff_millis: 250,
+            retrieval_max_backoff_secs: 2,
             command_buffer: 64,
             event_buffer: 256,
         }
@@ -562,6 +574,9 @@ fn validate_p2p(
     let listen_addresses = parse_multiaddrs("p2p.listen_addresses", file.listen_addresses)?;
     let bootnodes = parse_multiaddrs("p2p.bootnodes", file.bootnodes)?;
     if file.proof_request_timeout_secs == 0
+        || file.retrieval_timeout_secs == 0
+        || file.retrieval_initial_backoff_millis == 0
+        || file.retrieval_max_backoff_secs == 0
         || file.max_availability_message_bytes == 0
         || file.command_buffer == 0
         || file.event_buffer == 0
@@ -569,6 +584,31 @@ fn validate_p2p(
         return Err(Error::InvalidConfig(
             "P2P timeouts, message limits, and channel capacities must be greater than zero"
                 .to_owned(),
+        ));
+    }
+    if !(1..=256).contains(&file.max_concurrent_retrievals) {
+        return Err(Error::InvalidConfig(
+            "p2p.max_concurrent_retrievals must be between 1 and 256".to_owned(),
+        ));
+    }
+    let proof_request_timeout = Duration::from_secs(file.proof_request_timeout_secs);
+    let retrieval_timeout = Duration::from_secs(file.retrieval_timeout_secs);
+    let retrieval_initial_backoff = Duration::from_millis(file.retrieval_initial_backoff_millis);
+    let retrieval_max_backoff = Duration::from_secs(file.retrieval_max_backoff_secs);
+    if retrieval_initial_backoff > retrieval_max_backoff {
+        return Err(Error::InvalidConfig(
+            "p2p.retrieval_initial_backoff_millis must not exceed retrieval_max_backoff_secs"
+                .to_owned(),
+        ));
+    }
+    if retrieval_max_backoff > retrieval_timeout {
+        return Err(Error::InvalidConfig(
+            "p2p.retrieval_max_backoff_secs must not exceed retrieval_timeout_secs".to_owned(),
+        ));
+    }
+    if retrieval_timeout <= proof_request_timeout {
+        return Err(Error::InvalidConfig(
+            "p2p.retrieval_timeout_secs must be greater than proof_request_timeout_secs".to_owned(),
         ));
     }
 
@@ -580,7 +620,11 @@ fn validate_p2p(
         validator_key_path: file.validator_key_path,
         max_availability_message_bytes: file.max_availability_message_bytes,
         max_proof_bytes,
-        proof_request_timeout: Duration::from_secs(file.proof_request_timeout_secs),
+        proof_request_timeout,
+        max_concurrent_retrievals: file.max_concurrent_retrievals,
+        retrieval_timeout,
+        retrieval_initial_backoff,
+        retrieval_max_backoff,
         command_buffer: file.command_buffer,
         event_buffer: file.event_buffer,
     })
@@ -637,6 +681,13 @@ mod tests {
             Duration::from_secs(900)
         );
         assert!(!config.p2p.enabled);
+        assert_eq!(config.p2p.max_concurrent_retrievals, 16);
+        assert_eq!(config.p2p.retrieval_timeout, Duration::from_secs(30));
+        assert_eq!(
+            config.p2p.retrieval_initial_backoff,
+            Duration::from_millis(250)
+        );
+        assert_eq!(config.p2p.retrieval_max_backoff, Duration::from_secs(2));
         assert_eq!(config.verification.max_concurrent_jobs, 2);
         assert_eq!(config.verification.job_timeout, Duration::from_secs(30));
         assert_eq!(config.verification.max_retries, 2);
@@ -741,6 +792,7 @@ mod tests {
         assert!(config.p2p.enabled);
         assert_eq!(config.p2p.chain_id, "pulsar-test");
         assert_eq!(config.p2p.max_proof_bytes, 8 * 1024 * 1024);
+        assert_eq!(config.p2p.max_concurrent_retrievals, 16);
     }
 
     #[test]
@@ -770,6 +822,36 @@ mod tests {
             Err(Error::InvalidConfig(message))
                 if message.contains("shutdown_timeout_secs must be greater")
         ));
+    }
+
+    #[test]
+    fn rejects_invalid_p2p_retrieval_limits() {
+        for settings in [
+            "max_concurrent_retrievals = 0",
+            "max_concurrent_retrievals = 257",
+            "retrieval_timeout_secs = 0",
+            "retrieval_initial_backoff_millis = 0",
+            "retrieval_max_backoff_secs = 0",
+            "retrieval_initial_backoff_millis = 3000\nretrieval_max_backoff_secs = 2",
+            "retrieval_timeout_secs = 30\nretrieval_max_backoff_secs = 31",
+            "proof_request_timeout_secs = 10\nretrieval_timeout_secs = 10",
+        ] {
+            let file = config_file(&format!(
+                r#"
+                    [runtime]
+                    control_socket = "/tmp/control.sock"
+                    shutdown_timeout_secs = 15
+
+                    [p2p]
+                    {settings}
+                "#,
+            ));
+
+            assert!(matches!(
+                Config::from_file(file.path()),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
     }
 
     #[test]

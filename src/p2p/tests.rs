@@ -1,5 +1,6 @@
 use std::{collections::HashSet, net::TcpListener, path::PathBuf, sync::Arc, time::Duration};
 
+use async_trait::async_trait;
 use bytes::Bytes;
 use libp2p::{Multiaddr, PeerId, identity};
 use tokio::{sync::mpsc, task::JoinHandle, time::timeout};
@@ -8,12 +9,27 @@ use tokio_util::sync::CancellationToken;
 use super::{Driver, DriverClient, DriverEvent, DriverParts, Worker};
 use crate::{
     Result,
-    config::{P2pConfig, ProofStoreConfig},
+    config::{P2pConfig, ProofStoreConfig, VerificationConfig},
     proof::{Proof, ProofType, VerificationId},
-    store::{ProofSource, ProofStore},
+    store::{
+        ProofSource, ProofStore, VerificationFailure, VerificationStatus, VerificationVerdict,
+    },
+    verification::{VerificationWorker, Verifier, VerifierRegistry},
 };
 
 const EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct ValidVerifier;
+
+#[async_trait]
+impl Verifier for ValidVerifier {
+    async fn verify(
+        &self,
+        _proof: &Proof,
+    ) -> std::result::Result<VerificationVerdict, VerificationFailure> {
+        Ok(VerificationVerdict::Valid)
+    }
+}
 
 fn proof(bytes: impl Into<Bytes>) -> Proof {
     Proof {
@@ -103,6 +119,10 @@ fn test_config(listen_address: Multiaddr) -> P2pConfig {
         max_availability_message_bytes: 64 * 1024,
         max_proof_bytes: 8 * 1024 * 1024,
         proof_request_timeout: Duration::from_secs(3),
+        max_concurrent_retrievals: 16,
+        retrieval_timeout: Duration::from_secs(10),
+        retrieval_initial_backoff: Duration::from_millis(50),
+        retrieval_max_backoff: Duration::from_millis(200),
         command_buffer: 32,
         event_buffer: 128,
     }
@@ -627,15 +647,24 @@ impl StoreBackedNode {
         address: Multiaddr,
         store: Arc<ProofStore>,
     ) -> Self {
-        let peer_id = identity.public().to_peer_id();
         let config = test_config(address);
+        Self::start_with_config(identity, authorized, config, store).await
+    }
+
+    async fn start_with_config(
+        identity: identity::Keypair,
+        authorized: HashSet<PeerId>,
+        config: P2pConfig,
+        store: Arc<ProofStore>,
+    ) -> Self {
+        let peer_id = identity.public().to_peer_id();
         let DriverParts {
             driver,
             client,
             events,
             ready,
         } = Driver::build(config.clone(), identity, authorized).unwrap();
-        let worker = Worker::new(client.clone(), events, store);
+        let worker = Worker::new(client.clone(), events, store, peer_id, &config);
         let worker_stop = CancellationToken::new();
         let driver_task = tokio::spawn(driver.run());
         let worker_task = tokio::spawn(worker.run(worker_stop.clone()));
@@ -735,22 +764,123 @@ async fn worker_serves_and_stores_chain_observed_proof() {
     let client_store = Arc::new(ProofStore::new(ProofStoreConfig::test_default()).unwrap());
     let proof = proof(Bytes::from_static(b"store-backed-proof"));
     let verification_id = proof.verification_id();
+    let server = StoreBackedNode::start(
+        server_identity,
+        authorized.clone(),
+        server_address.clone(),
+        Arc::clone(&server_store),
+    )
+    .await;
+    let client = StoreBackedNode::start(
+        client_identity,
+        authorized,
+        "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+        Arc::clone(&client_store),
+    )
+    .await;
+    let verification_stop = CancellationToken::new();
+    let verification_worker = VerificationWorker::new(
+        Arc::clone(&client_store),
+        VerifierRegistry::new([(
+            ProofType::MinaPickles,
+            Arc::new(ValidVerifier) as Arc<dyn Verifier>,
+        )])
+        .unwrap(),
+        VerificationConfig {
+            max_concurrent_jobs: 1,
+            job_timeout: Duration::from_secs(1),
+            max_retries: 0,
+            retry_backoff: Duration::from_millis(10),
+        },
+    );
+    let verification_task = tokio::spawn(verification_worker.run(verification_stop.clone()));
+
+    client
+        .client
+        .dial(server_peer, vec![server_address])
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
     server_store
         .insert_local_proof(proof.clone(), ProofSource::Rpc)
         .await
         .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if client.client.providers(verification_id).await.unwrap() == vec![server_peer] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    assert!(client_store.get_proof(verification_id).await.is_none());
+
     client_store
         .observe_chain_verification(verification_id)
         .await
         .unwrap();
 
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if client_store
+                .get_proof(verification_id)
+                .await
+                .is_some_and(|received| received == proof)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if client_store.statuses(&[verification_id]).await[0].status
+                == VerificationStatus::Completed(VerificationVerdict::Valid)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    server.stop().await;
+    client.stop().await;
+    verification_stop.cancel();
+    verification_task.await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn worker_falls_back_after_not_found_provider() {
+    let liar_identity = identity::Keypair::generate_ed25519();
+    let server_identity = identity::Keypair::generate_ed25519();
+    let client_identity = identity::Keypair::generate_ed25519();
+    let liar_peer = liar_identity.public().to_peer_id();
+    let server_peer = server_identity.public().to_peer_id();
+    let client_peer = client_identity.public().to_peer_id();
+    let authorized = HashSet::from([liar_peer, server_peer, client_peer]);
+    let server_address = free_tcp_address();
+
+    let mut liar = TestNode::start(
+        liar_identity,
+        authorized.clone(),
+        "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+    )
+    .await;
+    let server_store = Arc::new(ProofStore::new(ProofStoreConfig::test_default()).unwrap());
     let server = StoreBackedNode::start(
         server_identity,
         authorized.clone(),
         server_address.clone(),
-        server_store,
+        Arc::clone(&server_store),
     )
     .await;
+    let client_store = Arc::new(ProofStore::new(ProofStoreConfig::test_default()).unwrap());
     let client = StoreBackedNode::start(
         client_identity,
         authorized,
@@ -761,13 +891,48 @@ async fn worker_serves_and_stores_chain_observed_proof() {
 
     client
         .client
+        .dial(liar_peer, vec![liar.listen_address.clone()])
+        .await
+        .unwrap();
+    client
+        .client
         .dial(server_peer, vec![server_address])
         .await
         .unwrap();
-    tokio::time::sleep(Duration::from_millis(250)).await;
-    client
-        .client
-        .request_proof(server_peer, verification_id)
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let proof = proof(Bytes::from_static(b"fallback-proof"));
+    let verification_id = proof.verification_id();
+    liar.client.announce(verification_id).await.unwrap();
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if client.client.providers(verification_id).await.unwrap() == vec![liar_peer] {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    client_store
+        .observe_chain_verification(verification_id)
+        .await
+        .unwrap();
+    let request_id = loop {
+        if let DriverEvent::ProofRequested {
+            request_id,
+            verification_id: requested,
+            ..
+        } = next_event(&mut liar.events).await
+        {
+            assert_eq!(requested, verification_id);
+            break request_id;
+        }
+    };
+    liar.client.respond_proof(request_id, None).await.unwrap();
+    server_store
+        .insert_local_proof(proof.clone(), ProofSource::Rpc)
         .await
         .unwrap();
 
@@ -786,8 +951,179 @@ async fn worker_serves_and_stores_chain_observed_proof() {
     .await
     .unwrap();
 
+    liar.stop().await;
     server.stop().await;
     client.stop().await;
+}
+
+#[tokio::test]
+async fn new_announcement_restarts_retrieval_after_deadline() {
+    let server_identity = identity::Keypair::generate_ed25519();
+    let client_identity = identity::Keypair::generate_ed25519();
+    let server_peer = server_identity.public().to_peer_id();
+    let client_peer = client_identity.public().to_peer_id();
+    let authorized = HashSet::from([server_peer, client_peer]);
+    let client_store = Arc::new(ProofStore::new(ProofStoreConfig::test_default()).unwrap());
+    let proof = proof(Bytes::from_static(b"late-provider-proof"));
+    let verification_id = proof.verification_id();
+    client_store
+        .observe_chain_verification(verification_id)
+        .await
+        .unwrap();
+
+    let mut client_config = test_config("/ip4/127.0.0.1/tcp/0".parse().unwrap());
+    client_config.proof_request_timeout = Duration::from_millis(100);
+    client_config.retrieval_timeout = Duration::from_millis(300);
+    client_config.retrieval_initial_backoff = Duration::from_millis(10);
+    client_config.retrieval_max_backoff = Duration::from_millis(50);
+    let client = StoreBackedNode::start_with_config(
+        client_identity,
+        authorized.clone(),
+        client_config,
+        Arc::clone(&client_store),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let server_address = free_tcp_address();
+    let server_store = Arc::new(ProofStore::new(ProofStoreConfig::test_default()).unwrap());
+    let server = StoreBackedNode::start(
+        server_identity,
+        authorized,
+        server_address.clone(),
+        Arc::clone(&server_store),
+    )
+    .await;
+    client
+        .client
+        .dial(server_peer, vec![server_address])
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    server_store
+        .insert_local_proof(proof.clone(), ProofSource::Rpc)
+        .await
+        .unwrap();
+
+    timeout(Duration::from_secs(5), async {
+        loop {
+            if client_store
+                .get_proof(verification_id)
+                .await
+                .is_some_and(|received| received == proof)
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+
+    client.stop().await;
+    server.stop().await;
+}
+
+#[tokio::test]
+async fn worker_limits_two_hundred_fifty_six_retrievals_to_sixteen_requests() {
+    const PROOF_COUNT: usize = 256;
+    const CONCURRENCY: usize = 16;
+
+    let server_identity = identity::Keypair::generate_ed25519();
+    let client_identity = identity::Keypair::generate_ed25519();
+    let server_peer = server_identity.public().to_peer_id();
+    let client_peer = client_identity.public().to_peer_id();
+    let authorized = HashSet::from([server_peer, client_peer]);
+    let mut server = TestNode::start(
+        server_identity,
+        authorized.clone(),
+        "/ip4/127.0.0.1/tcp/0".parse().unwrap(),
+    )
+    .await;
+    let client_store = Arc::new(ProofStore::new(ProofStoreConfig::test_default()).unwrap());
+    let mut config = test_config("/ip4/127.0.0.1/tcp/0".parse().unwrap());
+    config.max_concurrent_retrievals = CONCURRENCY;
+    config.retrieval_timeout = Duration::from_secs(120);
+    let client = StoreBackedNode::start_with_config(
+        client_identity,
+        authorized,
+        config,
+        Arc::clone(&client_store),
+    )
+    .await;
+    client
+        .client
+        .dial(server_peer, vec![server.listen_address.clone()])
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+
+    let verification_ids = (0..PROOF_COUNT)
+        .map(|index| proof(format!("bounded-retrieval-{index}")).verification_id())
+        .collect::<Vec<_>>();
+    for verification_id in &verification_ids {
+        server.client.announce(*verification_id).await.unwrap();
+    }
+    timeout(Duration::from_secs(10), async {
+        loop {
+            let mut all_known = true;
+            for verification_id in &verification_ids {
+                if client.client.providers(*verification_id).await.unwrap() != vec![server_peer] {
+                    all_known = false;
+                    break;
+                }
+            }
+            if all_known {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    for verification_id in &verification_ids {
+        client_store
+            .observe_chain_verification(*verification_id)
+            .await
+            .unwrap();
+    }
+
+    let mut requests = Vec::with_capacity(PROOF_COUNT);
+    while requests.len() < CONCURRENCY {
+        if let DriverEvent::ProofRequested { request_id, .. } = next_event(&mut server.events).await
+        {
+            requests.push(request_id);
+        }
+    }
+    let seventeenth = timeout(Duration::from_millis(200), async {
+        loop {
+            if let DriverEvent::ProofRequested { request_id, .. } =
+                next_event(&mut server.events).await
+            {
+                return request_id;
+            }
+        }
+    })
+    .await;
+    assert!(seventeenth.is_err());
+
+    let mut completed = 0;
+    while completed < PROOF_COUNT {
+        for request_id in requests.drain(..) {
+            server.client.respond_proof(request_id, None).await.unwrap();
+            completed += 1;
+        }
+        while completed + requests.len() < PROOF_COUNT && requests.len() < CONCURRENCY {
+            if let DriverEvent::ProofRequested { request_id, .. } =
+                next_event(&mut server.events).await
+            {
+                requests.push(request_id);
+            }
+        }
+    }
+
+    client.stop().await;
+    server.stop().await;
 }
 
 fn free_tcp_address() -> Multiaddr {
