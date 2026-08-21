@@ -284,13 +284,19 @@ async fn initialize(
 ) -> Result<()> {
     let status = client.status().await?;
     reconcile_active_window(client, store, status.latest_height).await?;
-    let validators_hash = client.validators_hash(status.latest_height).await?;
     if let Some(updater) = validator_updates {
-        updater.replace_at(status.latest_height).await?;
+        let validators_hash = client.validators_hash(status.latest_height).await?;
+        if validator_set_changed(state.validators_hash, validators_hash) {
+            updater.replace_at(status.latest_height).await?;
+        }
+        state.validators_hash = Some(validators_hash);
     }
     state.last_height = Some(status.latest_height);
-    state.validators_hash = Some(validators_hash);
     Ok(())
+}
+
+fn validator_set_changed(previous: Option<[u8; 32]>, current: [u8; 32]) -> bool {
+    previous != Some(current)
 }
 
 async fn process_block(
@@ -313,7 +319,7 @@ async fn process_block(
     }
 
     if state.last_height.is_none_or(|height| block.height > height) {
-        if state.validators_hash != Some(block.validators_hash)
+        if validator_set_changed(state.validators_hash, block.validators_hash)
             && let Some(updater) = validator_updates
         {
             // Fetch and validate the complete snapshot before mutating the Driver.
@@ -570,6 +576,13 @@ mod tests {
         assert_eq!(active_heights(1).collect::<Vec<_>>(), vec![1]);
         assert_eq!(active_heights(2).collect::<Vec<_>>(), vec![1, 2]);
         assert_eq!(active_heights(10).collect::<Vec<_>>(), vec![8, 9, 10]);
+    }
+
+    #[test]
+    fn validator_refresh_is_needed_only_when_the_hash_changes() {
+        assert!(validator_set_changed(None, [1; 32]));
+        assert!(!validator_set_changed(Some([1; 32]), [1; 32]));
+        assert!(validator_set_changed(Some([1; 32]), [2; 32]));
     }
 
     #[tokio::test]

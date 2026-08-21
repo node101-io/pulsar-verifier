@@ -62,6 +62,8 @@ impl App {
             Arc::clone(&proof_store),
             validator_updates,
             &control,
+            &mut p2p,
+            &mut verification_task,
         )
         .await
         {
@@ -80,6 +82,31 @@ impl App {
                 request_result?;
                 tracing::info!("pulsar verifier stopped during startup");
                 return Ok(());
+            }
+            Ok(ListenerStartup::P2pTask(exit)) => {
+                let error = exit.into_error();
+                cleanup_startup(
+                    &mut p2p,
+                    None,
+                    &verification_stop,
+                    &mut verification_task,
+                    None,
+                )
+                .await;
+                return Err(error);
+            }
+            Ok(ListenerStartup::VerificationTask(task)) => {
+                verification_task.take();
+                let error = unexpected_task_error(VERIFICATION_TASK, task);
+                cleanup_startup(
+                    &mut p2p,
+                    None,
+                    &verification_stop,
+                    &mut verification_task,
+                    None,
+                )
+                .await;
+                return Err(error);
             }
             Err(error) => {
                 cleanup_startup(
@@ -166,6 +193,8 @@ enum ListenerStartup {
     Started(PulsarListener),
     Disabled,
     Shutdown(Result<()>),
+    P2pTask(P2pExit),
+    VerificationTask(std::result::Result<Result<()>, tokio::task::JoinError>),
 }
 
 async fn start_listener(
@@ -174,6 +203,8 @@ async fn start_listener(
     store: Arc<ProofStore>,
     validator_updates: Option<ValidatorSetUpdater>,
     control: &ControlServer,
+    p2p: &mut Option<P2pService>,
+    verification_task: &mut Option<JoinHandle<Result<()>>>,
 ) -> Result<ListenerStartup> {
     if !config.enabled {
         return Ok(ListenerStartup::Disabled);
@@ -190,6 +221,10 @@ async fn start_listener(
         result = wait_for_signal() => {
             tracing::info!("shutdown requested by process signal during startup");
             Ok(ListenerStartup::Shutdown(result))
+        }
+        task = wait_for_p2p_exit(p2p) => Ok(ListenerStartup::P2pTask(task)),
+        task = wait_for_verification_exit(verification_task) => {
+            Ok(ListenerStartup::VerificationTask(task))
         }
     }
 }
@@ -522,6 +557,7 @@ mod tests {
             VerificationConfig,
         },
         control::request_shutdown,
+        store::ProofStore,
     };
 
     fn test_config(temp_dir: &TempDir) -> Config {
@@ -599,5 +635,46 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(!client_config.control_socket.exists());
+    }
+
+    #[tokio::test]
+    async fn listener_startup_observes_verification_worker_exit() {
+        let temp_dir = TempDir::new().unwrap();
+        let config = test_config(&temp_dir);
+        let control = ControlServer::bind(&config.runtime.control_socket)
+            .await
+            .unwrap();
+        let store = Arc::new(ProofStore::new(config.proof_store).unwrap());
+        let mut p2p = None;
+        let mut verification_task = Some(tokio::spawn(async {
+            Err(Error::ProofStore("startup failure".to_owned()))
+        }));
+
+        let result = start_listener(
+            ListenerConfig {
+                enabled: true,
+                reconnect_initial_backoff: Duration::from_millis(10),
+                reconnect_max_backoff: Duration::from_millis(20),
+            },
+            ChainConfig {
+                chain_id: "pulsar-test".to_owned(),
+                comet_rpc_url: "http://127.0.0.1:9".to_owned(),
+                request_timeout: Duration::from_secs(1),
+            },
+            store,
+            None,
+            &control,
+            &mut p2p,
+            &mut verification_task,
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(
+            result,
+            ListenerStartup::VerificationTask(Ok(Err(Error::ProofStore(message))))
+                if message == "startup failure"
+        ));
+        verification_task.take();
     }
 }

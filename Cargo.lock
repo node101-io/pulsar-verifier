@@ -2884,6 +2884,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "tendermint",
  "tendermint-rpc",
  "thiserror 2.0.18",
  "tokio",

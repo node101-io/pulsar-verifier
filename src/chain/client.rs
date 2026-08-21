@@ -58,17 +58,14 @@ pub(crate) struct NewBlockSubscription {
 
 impl NewBlockSubscription {
     pub(crate) async fn next(&mut self) -> Result<Option<CommittedBlock>> {
-        let event = timeout(
-            self.timeout,
-            self.events
-                .as_mut()
-                .expect("subscription exists until close")
-                .next(),
-        )
-        .await
-        .map_err(|_| Error::Chain("NewBlock subscription timed out".to_owned()))?
-        .transpose()
-        .map_err(chain_error)?;
+        let event = self
+            .events
+            .as_mut()
+            .expect("subscription exists until close")
+            .next()
+            .await
+            .transpose()
+            .map_err(chain_error)?;
         event.map(committed_block).transpose()
     }
 
@@ -174,15 +171,16 @@ impl PulsarClient {
 
     /// Loads one complete validator snapshot at an exact committed height.
     pub(crate) async fn validator_public_keys(&self, height: u64) -> Result<Vec<[u8; 32]>> {
-        let height_u32 = u32::try_from(height)
-            .map_err(|_| Error::Chain(format!("validator height {height} exceeds u32")))?;
+        let height = tendermint::block::Height::try_from(height)
+            .map_err(|error| Error::Chain(format!("invalid validator height: {error}")))?;
         let response = self
-            .with_timeout("validators", self.http.validators(height_u32, Paging::All))
+            .with_timeout("validators", self.http.validators(height, Paging::All))
             .await?;
-        if response.block_height.value() != height {
+        if response.block_height != height {
             return Err(Error::Chain(format!(
-                "validator response height {} does not match requested height {height}",
-                response.block_height.value()
+                "validator response height {} does not match requested height {}",
+                response.block_height.value(),
+                height.value()
             )));
         }
         let total = usize::try_from(response.total).map_err(|_| {
@@ -218,15 +216,14 @@ impl PulsarClient {
     }
 
     pub(crate) async fn validators_hash(&self, height: u64) -> Result<[u8; 32]> {
-        let height_u32 = u32::try_from(height)
-            .map_err(|_| Error::Chain(format!("block height {height} exceeds u32")))?;
-        let response = self
-            .with_timeout("block", self.http.block(height_u32))
-            .await?;
-        if response.block.header.height.value() != height {
+        let height = tendermint::block::Height::try_from(height)
+            .map_err(|error| Error::Chain(format!("invalid block height: {error}")))?;
+        let response = self.with_timeout("block", self.http.block(height)).await?;
+        if response.block.header.height != height {
             return Err(Error::Chain(format!(
-                "block response height {} does not match requested height {height}",
-                response.block.header.height.value()
+                "block response height {} does not match requested height {}",
+                response.block.header.height.value(),
+                height.value()
             )));
         }
         response
@@ -250,6 +247,7 @@ impl PulsarClient {
         let mut positions = HashSet::new();
         let mut pagination_keys = HashSet::new();
         let mut last_index = None;
+        let mut query_height = None;
 
         loop {
             if !pagination_keys.insert(next_key.clone()) {
@@ -273,11 +271,22 @@ impl PulsarClient {
                     self.http.abci_query(
                         Some(PROOFS_BY_HEIGHT_PATH.to_owned()),
                         request.encode_to_vec(),
-                        None,
+                        query_height,
                         false,
                     ),
                 )
                 .await?;
+            if let Some(expected) = query_height {
+                if response.height != expected {
+                    return Err(Error::InvalidChainContract(format!(
+                        "ProofsByHeight response height {} does not match pinned height {}",
+                        response.height.value(),
+                        expected.value()
+                    )));
+                }
+            } else {
+                query_height = Some(response.height);
+            }
             if !response.code.is_ok() {
                 return Err(Error::Chain(format!(
                     "ProofsByHeight ABCI query failed with code {}: {}",
@@ -629,6 +638,100 @@ mod tests {
         let proofs = client(url).proofs_by_height(42).await.unwrap();
         assert_eq!(proofs.len(), 1);
         assert_eq!(proofs[0].verification_id, id);
+
+        stop.cancel();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn pins_proof_pagination_to_the_first_response_height() {
+        let calls = Arc::new(Mutex::new(0_usize));
+        let recorded = Arc::clone(&calls);
+        let handler: Handler = Arc::new(move |request| {
+            let mut call = recorded.lock().unwrap();
+            let index = *call;
+            *call += 1;
+            if index == 1 {
+                assert_eq!(request["params"]["height"], "99");
+            }
+            let component = u8::try_from(index + 1).unwrap();
+            let id = VerificationId::from_component_hashes(
+                ProofType::NoirBarretenberg,
+                &[component; 32],
+                &[2; 32],
+                &[3; 32],
+            );
+            let response = QueryProofsByHeightResponse {
+                proofs: vec![QueryProofResponse {
+                    proof_key: Some(ProofKey {
+                        submission_height: 42,
+                        index_in_block: u32::try_from(index).unwrap(),
+                    }),
+                    state: Some(query_proof_response::State::Pending(ProofRecord {
+                        proof_hash: vec![component; 32],
+                        proof_type: 2,
+                        public_inputs_hash: vec![2; 32],
+                        verification_key_hash: vec![3; 32],
+                        verification_id: id.as_bytes().to_vec(),
+                    })),
+                }],
+                pagination: Some(PageResponse {
+                    next_key: (index == 0).then(|| vec![7]).unwrap_or_default(),
+                    total: 2,
+                }),
+            };
+            rpc_result(
+                &request,
+                &serde_json::json!({
+                    "response": {
+                        "code": 0,
+                        "codespace": "",
+                        "height": "99",
+                        "index": "0",
+                        "info": "",
+                        "key": "",
+                        "log": "",
+                        "proofOps": null,
+                        "value": STANDARD.encode(response.encode_to_vec()),
+                    }
+                }),
+            )
+        });
+        let (url, stop, server) = spawn_rpc_server(handler).await;
+
+        assert_eq!(client(url).proofs_by_height(42).await.unwrap().len(), 2);
+        assert_eq!(*calls.lock().unwrap(), 2);
+
+        stop.cancel();
+        server.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn validator_queries_accept_heights_above_u32() {
+        let height = u64::from(u32::MAX) + 1;
+        let public = validator(identity::Keypair::generate_ed25519().public());
+        let handler: Handler = Arc::new(move |request| {
+            assert_eq!(request["params"]["height"], height.to_string());
+            rpc_result(
+                &request,
+                &serde_json::json!({
+                    "block_height": height.to_string(),
+                    "validators": [public],
+                    "count": "1",
+                    "total": "1",
+                }),
+            )
+        });
+        let (url, stop, server) = spawn_rpc_server(handler).await;
+
+        assert_eq!(
+            client(url)
+                .validator_public_keys(height)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
 
         stop.cancel();
         server.await.unwrap();
