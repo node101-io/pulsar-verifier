@@ -15,18 +15,18 @@ message AvailabilityMessage {
 
 // Announces that the authenticated source peer currently stores the proof.
 message AvailabilityAnnouncement {
-  bytes proof_hash = 1;
+  bytes verification_id = 1;
 }
 
-// Asks peers to return providers already known for the proof hash.
+// Asks peers to return providers already known for the verification.
 message AvailabilityQuery {
   bytes request_id = 1;
-  bytes proof_hash = 2;
+  bytes verification_id = 2;
 }
 
 // Returns authorized provider hints; the responder need not own the proof.
 message AvailabilityResponse {
   bytes request_id = 1;
-  bytes proof_hash = 2;
+  bytes verification_id = 2;
   repeated bytes provider_peer_ids = 3;
 }

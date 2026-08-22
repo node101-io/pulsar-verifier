@@ -1,12 +1,13 @@
 use std::{
     fs,
+    net::SocketAddr,
     path::{Path, PathBuf},
     time::Duration,
 };
 
 use libp2p::Multiaddr;
-use reqwest::Url;
 use serde::Deserialize;
+use tendermint_rpc::HttpClient;
 
 use crate::{Error, Result};
 
@@ -14,8 +15,98 @@ use crate::{Error, Result};
 #[derive(Debug, Clone)]
 pub struct Config {
     pub runtime: RuntimeConfig,
+    pub chain: ChainConfig,
+    pub listener: ListenerConfig,
     pub proof_store: ProofStoreConfig,
     pub p2p: P2pConfig,
+    pub verification: VerificationConfig,
+    pub noir: NoirConfig,
+    pub rpc: RpcConfig,
+    pub submission: SubmissionConfig,
+}
+
+/// Shared Pulsar chain identity and local `CometBFT` RPC settings.
+#[derive(Debug, Clone)]
+pub struct ChainConfig {
+    pub chain_id: String,
+    pub comet_rpc_url: String,
+    pub request_timeout: Duration,
+}
+
+/// Committed-block listener reconnect settings.
+#[derive(Debug, Clone, Copy)]
+pub struct ListenerConfig {
+    pub enabled: bool,
+    pub reconnect_initial_backoff: Duration,
+    pub reconnect_max_backoff: Duration,
+}
+
+/// Loopback-only chain-facing gRPC server settings.
+#[derive(Debug, Clone, Copy)]
+pub struct RpcConfig {
+    pub enabled: bool,
+    pub listen_address: SocketAddr,
+}
+
+impl RpcConfig {
+    #[cfg(test)]
+    pub(crate) fn disabled() -> Self {
+        Self {
+            enabled: false,
+            listen_address: "127.0.0.1:50051".parse().expect("valid test address"),
+        }
+    }
+}
+
+/// Loopback-only consumer proof ingress and resource limits.
+#[derive(Debug, Clone, Copy)]
+pub struct SubmissionConfig {
+    pub enabled: bool,
+    pub listen_address: SocketAddr,
+    pub max_transaction_bytes: usize,
+    pub max_concurrent_requests: usize,
+}
+
+impl SubmissionConfig {
+    #[cfg(test)]
+    pub(crate) fn disabled() -> Self {
+        Self {
+            enabled: false,
+            listen_address: "127.0.0.1:50052".parse().expect("valid test address"),
+            max_transaction_bytes: 1024 * 1024,
+            max_concurrent_requests: 16,
+        }
+    }
+}
+
+/// Resource limits for asynchronous proof verification jobs.
+#[derive(Debug, Clone, Copy)]
+pub struct VerificationConfig {
+    pub max_concurrent_jobs: usize,
+    pub job_timeout: Duration,
+    pub max_retries: u32,
+    pub retry_backoff: Duration,
+}
+
+/// Validated process settings for the optional Noir/Barretenberg backend.
+#[derive(Debug, Clone)]
+pub struct NoirConfig {
+    pub enabled: bool,
+    pub binary_path: PathBuf,
+    pub home_directory: PathBuf,
+    pub threads_per_job: usize,
+}
+
+impl NoirConfig {
+    #[cfg(test)]
+    pub(crate) fn disabled() -> Self {
+        Self {
+            enabled: false,
+            binary_path: PathBuf::new(),
+            home_directory: PathBuf::new(),
+            threads_per_job: 1,
+        }
+    }
 }
 
 /// Process lifecycle settings shared by the `run` and `stop` commands.
@@ -42,11 +133,13 @@ pub struct P2pConfig {
     pub listen_addresses: Vec<Multiaddr>,
     pub bootnodes: Vec<Multiaddr>,
     pub validator_key_path: PathBuf,
-    pub comet_rpc_url: Url,
-    pub comet_rpc_timeout: Duration,
     pub max_availability_message_bytes: usize,
     pub max_proof_bytes: usize,
     pub proof_request_timeout: Duration,
+    pub max_concurrent_retrievals: usize,
+    pub retrieval_timeout: Duration,
+    pub retrieval_initial_backoff: Duration,
+    pub retrieval_max_backoff: Duration,
     pub command_buffer: usize,
     pub event_buffer: usize,
 }
@@ -54,7 +147,7 @@ pub struct P2pConfig {
 impl P2pConfig {
     #[cfg(test)]
     pub(crate) fn disabled() -> Self {
-        validate_p2p(FileP2pConfig::default(), 8 * 1024 * 1024)
+        validate_p2p(FileP2pConfig::default(), 8 * 1024 * 1024, String::new())
             .expect("default P2P config must be valid")
     }
 }
@@ -72,9 +165,133 @@ impl ProofStoreConfig {
 struct FileConfig {
     runtime: FileRuntimeConfig,
     #[serde(default)]
+    chain: FileChainConfig,
+    #[serde(default)]
+    listener: FileListenerConfig,
+    #[serde(default)]
     proof_store: FileProofStoreConfig,
     #[serde(default)]
     p2p: FileP2pConfig,
+    #[serde(default)]
+    verification: FileVerificationConfig,
+    #[serde(default)]
+    rpc: FileRpcConfig,
+    #[serde(default)]
+    submission: FileSubmissionConfig,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileChainConfig {
+    chain_id: String,
+    comet_rpc_url: String,
+    request_timeout_secs: u64,
+}
+
+impl Default for FileChainConfig {
+    fn default() -> Self {
+        Self {
+            chain_id: String::new(),
+            comet_rpc_url: "http://127.0.0.1:26657".to_owned(),
+            request_timeout_secs: 5,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone, Copy)]
+#[serde(default, deny_unknown_fields)]
+struct FileListenerConfig {
+    enabled: bool,
+    reconnect_initial_backoff_millis: u64,
+    reconnect_max_backoff_secs: u64,
+}
+
+impl Default for FileListenerConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            reconnect_initial_backoff_millis: 250,
+            reconnect_max_backoff_secs: 30,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileRpcConfig {
+    enabled: bool,
+    listen_address: String,
+}
+
+impl Default for FileRpcConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_address: "127.0.0.1:50051".to_owned(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+struct FileSubmissionConfig {
+    enabled: bool,
+    listen_address: String,
+    max_transaction_bytes: usize,
+    max_concurrent_requests: usize,
+}
+
+impl Default for FileSubmissionConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen_address: "127.0.0.1:50052".to_owned(),
+            max_transaction_bytes: 1024 * 1024,
+            max_concurrent_requests: 16,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default, deny_unknown_fields)]
+struct FileVerificationConfig {
+    max_concurrent_jobs: usize,
+    job_timeout_secs: u64,
+    max_retries: u32,
+    retry_backoff_millis: u64,
+    noir: FileNoirConfig,
+}
+
+impl Default for FileVerificationConfig {
+    fn default() -> Self {
+        Self {
+            max_concurrent_jobs: 2,
+            job_timeout_secs: 30,
+            max_retries: 2,
+            retry_backoff_millis: 250,
+            noir: FileNoirConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default, deny_unknown_fields)]
+struct FileNoirConfig {
+    enabled: bool,
+    binary_path: PathBuf,
+    home_directory: PathBuf,
+    threads_per_job: usize,
+}
+
+impl Default for FileNoirConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            binary_path: PathBuf::new(),
+            home_directory: PathBuf::new(),
+            threads_per_job: 1,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize, Clone, Copy)]
@@ -108,14 +325,15 @@ struct FileRuntimeConfig {
 #[serde(default, deny_unknown_fields)]
 struct FileP2pConfig {
     enabled: bool,
-    chain_id: String,
     listen_addresses: Vec<String>,
     bootnodes: Vec<String>,
     validator_key_path: PathBuf,
-    comet_rpc_url: String,
-    comet_rpc_timeout_secs: u64,
     max_availability_message_bytes: usize,
     proof_request_timeout_secs: u64,
+    max_concurrent_retrievals: usize,
+    retrieval_timeout_secs: u64,
+    retrieval_initial_backoff_millis: u64,
+    retrieval_max_backoff_secs: u64,
     command_buffer: usize,
     event_buffer: usize,
 }
@@ -124,14 +342,15 @@ impl Default for FileP2pConfig {
     fn default() -> Self {
         Self {
             enabled: false,
-            chain_id: String::new(),
             listen_addresses: Vec::new(),
             bootnodes: Vec::new(),
             validator_key_path: PathBuf::new(),
-            comet_rpc_url: "http://127.0.0.1:26657".to_owned(),
-            comet_rpc_timeout_secs: 5,
             max_availability_message_bytes: 64 * 1024,
             proof_request_timeout_secs: 10,
+            max_concurrent_retrievals: 16,
+            retrieval_timeout_secs: 30,
+            retrieval_initial_backoff_millis: 250,
+            retrieval_max_backoff_secs: 2,
             command_buffer: 64,
             event_buffer: 256,
         }
@@ -167,18 +386,219 @@ impl Config {
             ));
         }
 
+        let runtime = RuntimeConfig {
+            control_socket: file.runtime.control_socket,
+            shutdown_timeout: Duration::from_secs(file.runtime.shutdown_timeout_secs),
+        };
         let proof_store = validate_proof_store(file.proof_store)?;
-        let p2p = validate_p2p(file.p2p, proof_store.max_proof_bytes)?;
+        let listener = validate_listener(file.listener)?;
+        let submission = validate_submission(&file.submission)?;
+        let chain = validate_chain(
+            file.chain,
+            file.p2p.enabled || listener.enabled || submission.enabled,
+        )?;
+        let p2p = validate_p2p(
+            file.p2p,
+            proof_store.max_proof_bytes,
+            chain.chain_id.clone(),
+        )?;
+        let (verification, noir) = validate_verification(file.verification)?;
+        let rpc = validate_rpc(&file.rpc)?;
+        if p2p.enabled && runtime.shutdown_timeout <= p2p.proof_request_timeout {
+            return Err(Error::InvalidConfig(
+                "runtime.shutdown_timeout_secs must be greater than p2p.proof_request_timeout_secs when P2P is enabled"
+                    .to_owned(),
+            ));
+        }
+        if submission.enabled && runtime.shutdown_timeout <= chain.request_timeout {
+            return Err(Error::InvalidConfig(
+                "runtime.shutdown_timeout_secs must be greater than chain.request_timeout_secs when submission is enabled"
+                    .to_owned(),
+            ));
+        }
+        if p2p.enabled && !listener.enabled {
+            return Err(Error::InvalidConfig(
+                "listener.enabled must be true when P2P is enabled".to_owned(),
+            ));
+        }
+        if submission.enabled && !listener.enabled {
+            return Err(Error::InvalidConfig(
+                "listener.enabled must be true when submission is enabled".to_owned(),
+            ));
+        }
+        if submission.enabled && !rpc.enabled {
+            return Err(Error::InvalidConfig(
+                "rpc.enabled must be true when submission is enabled".to_owned(),
+            ));
+        }
+        if submission.enabled && rpc.enabled && submission.listen_address == rpc.listen_address {
+            return Err(Error::InvalidConfig(
+                "submission.listen_address must differ from rpc.listen_address".to_owned(),
+            ));
+        }
 
         Ok(Self {
-            runtime: RuntimeConfig {
-                control_socket: file.runtime.control_socket,
-                shutdown_timeout: Duration::from_secs(file.runtime.shutdown_timeout_secs),
-            },
+            runtime,
+            chain,
+            listener,
             proof_store,
             p2p,
+            verification,
+            noir,
+            rpc,
+            submission,
         })
     }
+}
+
+fn validate_chain(file: FileChainConfig, required: bool) -> Result<ChainConfig> {
+    let chain_id = file.chain_id.trim();
+    if required && chain_id.is_empty() {
+        return Err(Error::InvalidConfig(
+            "chain.chain_id must not be empty when Listener, P2P, or submission is enabled"
+                .to_owned(),
+        ));
+    }
+    if !file.comet_rpc_url.starts_with("http://") && !file.comet_rpc_url.starts_with("https://") {
+        return Err(Error::InvalidConfig(
+            "chain.comet_rpc_url must use http or https".to_owned(),
+        ));
+    }
+    HttpClient::new(file.comet_rpc_url.as_str()).map_err(|error| {
+        Error::InvalidConfig(format!("chain.comet_rpc_url is invalid: {error}"))
+    })?;
+    if file.request_timeout_secs == 0 {
+        return Err(Error::InvalidConfig(
+            "chain.request_timeout_secs must be greater than zero".to_owned(),
+        ));
+    }
+    Ok(ChainConfig {
+        chain_id: chain_id.to_owned(),
+        comet_rpc_url: file.comet_rpc_url,
+        request_timeout: Duration::from_secs(file.request_timeout_secs),
+    })
+}
+
+fn validate_listener(file: FileListenerConfig) -> Result<ListenerConfig> {
+    if file.reconnect_initial_backoff_millis == 0 || file.reconnect_max_backoff_secs == 0 {
+        return Err(Error::InvalidConfig(
+            "Listener reconnect backoffs must be greater than zero".to_owned(),
+        ));
+    }
+    let initial = Duration::from_millis(file.reconnect_initial_backoff_millis);
+    let maximum = Duration::from_secs(file.reconnect_max_backoff_secs);
+    if initial > maximum {
+        return Err(Error::InvalidConfig(
+            "listener.reconnect_initial_backoff_millis must not exceed reconnect_max_backoff_secs"
+                .to_owned(),
+        ));
+    }
+    Ok(ListenerConfig {
+        enabled: file.enabled,
+        reconnect_initial_backoff: initial,
+        reconnect_max_backoff: maximum,
+    })
+}
+
+fn validate_rpc(file: &FileRpcConfig) -> Result<RpcConfig> {
+    let listen_address = validate_loopback_address("rpc", file.enabled, &file.listen_address)?;
+    Ok(RpcConfig {
+        enabled: file.enabled,
+        listen_address,
+    })
+}
+
+fn validate_submission(file: &FileSubmissionConfig) -> Result<SubmissionConfig> {
+    let listen_address =
+        validate_loopback_address("submission", file.enabled, &file.listen_address)?;
+    if !(1..=16 * 1024 * 1024).contains(&file.max_transaction_bytes) {
+        return Err(Error::InvalidConfig(
+            "submission.max_transaction_bytes must be between 1 byte and 16 MiB".to_owned(),
+        ));
+    }
+    if !(1..=64).contains(&file.max_concurrent_requests) {
+        return Err(Error::InvalidConfig(
+            "submission.max_concurrent_requests must be between 1 and 64".to_owned(),
+        ));
+    }
+    Ok(SubmissionConfig {
+        enabled: file.enabled,
+        listen_address,
+        max_transaction_bytes: file.max_transaction_bytes,
+        max_concurrent_requests: file.max_concurrent_requests,
+    })
+}
+
+fn validate_loopback_address(section: &str, enabled: bool, value: &str) -> Result<SocketAddr> {
+    let address = value.parse::<SocketAddr>().map_err(|error| {
+        Error::InvalidConfig(format!(
+            "{section}.listen_address must be a literal IP and port: {error}"
+        ))
+    })?;
+    if enabled && address.port() == 0 {
+        return Err(Error::InvalidConfig(format!(
+            "{section}.listen_address port must be greater than zero when enabled"
+        )));
+    }
+    if enabled && !address.ip().is_loopback() {
+        return Err(Error::InvalidConfig(format!(
+            "{section}.listen_address must use a loopback IP when enabled"
+        )));
+    }
+    Ok(address)
+}
+
+fn validate_verification(file: FileVerificationConfig) -> Result<(VerificationConfig, NoirConfig)> {
+    if !(1..=256).contains(&file.max_concurrent_jobs) {
+        return Err(Error::InvalidConfig(
+            "verification.max_concurrent_jobs must be between 1 and 256".to_owned(),
+        ));
+    }
+    if file.job_timeout_secs == 0 {
+        return Err(Error::InvalidConfig(
+            "verification.job_timeout_secs must be greater than zero".to_owned(),
+        ));
+    }
+    if file.max_retries > 10 {
+        return Err(Error::InvalidConfig(
+            "verification.max_retries must not exceed 10".to_owned(),
+        ));
+    }
+    if file.max_retries > 0 && file.retry_backoff_millis == 0 {
+        return Err(Error::InvalidConfig(
+            "verification.retry_backoff_millis must be greater than zero when retries are enabled"
+                .to_owned(),
+        ));
+    }
+
+    if !(1..=256).contains(&file.noir.threads_per_job) {
+        return Err(Error::InvalidConfig(
+            "verification.noir.threads_per_job must be between 1 and 256".to_owned(),
+        ));
+    }
+    if file.noir.enabled
+        && (!file.noir.binary_path.is_absolute() || !file.noir.home_directory.is_absolute())
+    {
+        return Err(Error::InvalidConfig(
+            "verification.noir binary_path and home_directory must be absolute when enabled"
+                .to_owned(),
+        ));
+    }
+
+    Ok((
+        VerificationConfig {
+            max_concurrent_jobs: file.max_concurrent_jobs,
+            job_timeout: Duration::from_secs(file.job_timeout_secs),
+            max_retries: file.max_retries,
+            retry_backoff: Duration::from_millis(file.retry_backoff_millis),
+        },
+        NoirConfig {
+            enabled: file.noir.enabled,
+            binary_path: file.noir.binary_path,
+            home_directory: file.noir.home_directory,
+            threads_per_job: file.noir.threads_per_job,
+        },
+    ))
 }
 
 fn validate_proof_store(file: FileProofStoreConfig) -> Result<ProofStoreConfig> {
@@ -206,13 +626,12 @@ fn validate_proof_store(file: FileProofStoreConfig) -> Result<ProofStoreConfig> 
     })
 }
 
-fn validate_p2p(file: FileP2pConfig, max_proof_bytes: usize) -> Result<P2pConfig> {
+fn validate_p2p(
+    file: FileP2pConfig,
+    max_proof_bytes: usize,
+    chain_id: String,
+) -> Result<P2pConfig> {
     if file.enabled {
-        if file.chain_id.trim().is_empty() {
-            return Err(Error::InvalidConfig(
-                "p2p.chain_id must not be empty when P2P is enabled".to_owned(),
-            ));
-        }
         if file.listen_addresses.is_empty() {
             return Err(Error::InvalidConfig(
                 "p2p.listen_addresses must not be empty when P2P is enabled".to_owned(),
@@ -227,16 +646,10 @@ fn validate_p2p(file: FileP2pConfig, max_proof_bytes: usize) -> Result<P2pConfig
 
     let listen_addresses = parse_multiaddrs("p2p.listen_addresses", file.listen_addresses)?;
     let bootnodes = parse_multiaddrs("p2p.bootnodes", file.bootnodes)?;
-    let comet_rpc_url = Url::parse(&file.comet_rpc_url)
-        .map_err(|error| Error::InvalidConfig(format!("p2p.comet_rpc_url is invalid: {error}")))?;
-
-    if !matches!(comet_rpc_url.scheme(), "http" | "https") {
-        return Err(Error::InvalidConfig(
-            "p2p.comet_rpc_url must use http or https".to_owned(),
-        ));
-    }
-    if file.comet_rpc_timeout_secs == 0
-        || file.proof_request_timeout_secs == 0
+    if file.proof_request_timeout_secs == 0
+        || file.retrieval_timeout_secs == 0
+        || file.retrieval_initial_backoff_millis == 0
+        || file.retrieval_max_backoff_secs == 0
         || file.max_availability_message_bytes == 0
         || file.command_buffer == 0
         || file.event_buffer == 0
@@ -246,18 +659,45 @@ fn validate_p2p(file: FileP2pConfig, max_proof_bytes: usize) -> Result<P2pConfig
                 .to_owned(),
         ));
     }
+    if !(1..=256).contains(&file.max_concurrent_retrievals) {
+        return Err(Error::InvalidConfig(
+            "p2p.max_concurrent_retrievals must be between 1 and 256".to_owned(),
+        ));
+    }
+    let proof_request_timeout = Duration::from_secs(file.proof_request_timeout_secs);
+    let retrieval_timeout = Duration::from_secs(file.retrieval_timeout_secs);
+    let retrieval_initial_backoff = Duration::from_millis(file.retrieval_initial_backoff_millis);
+    let retrieval_max_backoff = Duration::from_secs(file.retrieval_max_backoff_secs);
+    if retrieval_initial_backoff > retrieval_max_backoff {
+        return Err(Error::InvalidConfig(
+            "p2p.retrieval_initial_backoff_millis must not exceed retrieval_max_backoff_secs"
+                .to_owned(),
+        ));
+    }
+    if retrieval_max_backoff > retrieval_timeout {
+        return Err(Error::InvalidConfig(
+            "p2p.retrieval_max_backoff_secs must not exceed retrieval_timeout_secs".to_owned(),
+        ));
+    }
+    if retrieval_timeout <= proof_request_timeout {
+        return Err(Error::InvalidConfig(
+            "p2p.retrieval_timeout_secs must be greater than proof_request_timeout_secs".to_owned(),
+        ));
+    }
 
     Ok(P2pConfig {
         enabled: file.enabled,
-        chain_id: file.chain_id,
+        chain_id,
         listen_addresses,
         bootnodes,
         validator_key_path: file.validator_key_path,
-        comet_rpc_url,
-        comet_rpc_timeout: Duration::from_secs(file.comet_rpc_timeout_secs),
         max_availability_message_bytes: file.max_availability_message_bytes,
         max_proof_bytes,
-        proof_request_timeout: Duration::from_secs(file.proof_request_timeout_secs),
+        proof_request_timeout,
+        max_concurrent_retrievals: file.max_concurrent_retrievals,
+        retrieval_timeout,
+        retrieval_initial_backoff,
+        retrieval_max_backoff,
         command_buffer: file.command_buffer,
         event_buffer: file.event_buffer,
     })
@@ -314,6 +754,32 @@ mod tests {
             Duration::from_secs(900)
         );
         assert!(!config.p2p.enabled);
+        assert_eq!(config.p2p.max_concurrent_retrievals, 16);
+        assert_eq!(config.p2p.retrieval_timeout, Duration::from_secs(30));
+        assert_eq!(
+            config.p2p.retrieval_initial_backoff,
+            Duration::from_millis(250)
+        );
+        assert_eq!(config.p2p.retrieval_max_backoff, Duration::from_secs(2));
+        assert_eq!(config.verification.max_concurrent_jobs, 2);
+        assert_eq!(config.verification.job_timeout, Duration::from_secs(30));
+        assert_eq!(config.verification.max_retries, 2);
+        assert_eq!(
+            config.verification.retry_backoff,
+            Duration::from_millis(250)
+        );
+        assert!(!config.rpc.enabled);
+        assert_eq!(
+            config.rpc.listen_address,
+            "127.0.0.1:50051".parse().unwrap()
+        );
+        assert!(!config.submission.enabled);
+        assert_eq!(
+            config.submission.listen_address,
+            "127.0.0.1:50052".parse().unwrap()
+        );
+        assert_eq!(config.submission.max_transaction_bytes, 1024 * 1024);
+        assert_eq!(config.submission.max_concurrent_requests, 16);
     }
 
     #[test]
@@ -379,11 +845,16 @@ mod tests {
             r#"
                 [runtime]
                 control_socket = "/tmp/control.sock"
-                shutdown_timeout_secs = 10
+                shutdown_timeout_secs = 15
+
+                [chain]
+                chain_id = "pulsar-test"
+
+                [listener]
+                enabled = true
 
                 [p2p]
                 enabled = true
-                chain_id = "pulsar-test"
                 listen_addresses = ["/ip4/0.0.0.0/tcp/39000"]
                 validator_key_path = "/tmp/priv_validator_key.json"
             "#,
@@ -394,6 +865,66 @@ mod tests {
         assert!(config.p2p.enabled);
         assert_eq!(config.p2p.chain_id, "pulsar-test");
         assert_eq!(config.p2p.max_proof_bytes, 8 * 1024 * 1024);
+        assert_eq!(config.p2p.max_concurrent_retrievals, 16);
+    }
+
+    #[test]
+    fn rejects_p2p_request_timeout_without_shutdown_margin() {
+        let file = config_file(
+            r#"
+                [runtime]
+                control_socket = "/tmp/control.sock"
+                shutdown_timeout_secs = 10
+
+                [chain]
+                chain_id = "pulsar-test"
+
+                [listener]
+                enabled = true
+
+                [p2p]
+                enabled = true
+                listen_addresses = ["/ip4/0.0.0.0/tcp/39000"]
+                validator_key_path = "/tmp/priv_validator_key.json"
+                proof_request_timeout_secs = 10
+            "#,
+        );
+
+        assert!(matches!(
+            Config::from_file(file.path()),
+            Err(Error::InvalidConfig(message))
+                if message.contains("shutdown_timeout_secs must be greater")
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_p2p_retrieval_limits() {
+        for settings in [
+            "max_concurrent_retrievals = 0",
+            "max_concurrent_retrievals = 257",
+            "retrieval_timeout_secs = 0",
+            "retrieval_initial_backoff_millis = 0",
+            "retrieval_max_backoff_secs = 0",
+            "retrieval_initial_backoff_millis = 3000\nretrieval_max_backoff_secs = 2",
+            "retrieval_timeout_secs = 30\nretrieval_max_backoff_secs = 31",
+            "proof_request_timeout_secs = 10\nretrieval_timeout_secs = 10",
+        ] {
+            let file = config_file(&format!(
+                r#"
+                    [runtime]
+                    control_socket = "/tmp/control.sock"
+                    shutdown_timeout_secs = 15
+
+                    [p2p]
+                    {settings}
+                "#,
+            ));
+
+            assert!(matches!(
+                Config::from_file(file.path()),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
     }
 
     #[test]
@@ -403,6 +934,9 @@ mod tests {
                 [runtime]
                 control_socket = "/tmp/control.sock"
                 shutdown_timeout_secs = 10
+
+                [listener]
+                enabled = true
 
                 [p2p]
                 enabled = true
@@ -414,6 +948,71 @@ mod tests {
         assert!(matches!(
             Config::from_file(file.path()),
             Err(Error::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn listener_requires_valid_chain_and_reconnect_policy() {
+        for chain_and_listener in [
+            r"
+                [listener]
+                enabled = true
+            ",
+            r#"
+                [chain]
+                chain_id = "pulsar-test"
+                comet_rpc_url = "ftp://127.0.0.1:26657"
+
+                [listener]
+                enabled = true
+            "#,
+            r#"
+                [chain]
+                chain_id = "pulsar-test"
+
+                [listener]
+                enabled = true
+                reconnect_initial_backoff_millis = 31000
+                reconnect_max_backoff_secs = 30
+            "#,
+        ] {
+            let file = config_file(&format!(
+                r#"
+                    [runtime]
+                    control_socket = "/tmp/control.sock"
+                    shutdown_timeout_secs = 10
+
+                    {chain_and_listener}
+                "#,
+            ));
+            assert!(matches!(
+                Config::from_file(file.path()),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn enabled_p2p_requires_listener() {
+        let file = config_file(
+            r#"
+                [runtime]
+                control_socket = "/tmp/control.sock"
+                shutdown_timeout_secs = 15
+
+                [chain]
+                chain_id = "pulsar-test"
+
+                [p2p]
+                enabled = true
+                listen_addresses = ["/ip4/0.0.0.0/tcp/39000"]
+                validator_key_path = "/tmp/priv_validator_key.json"
+            "#,
+        );
+
+        assert!(matches!(
+            Config::from_file(file.path()),
+            Err(Error::InvalidConfig(message)) if message.contains("listener.enabled")
         ));
     }
 
@@ -434,6 +1033,271 @@ mod tests {
         assert!(matches!(
             Config::from_file(file.path()),
             Err(Error::InvalidConfig(_))
+        ));
+    }
+
+    #[test]
+    fn rejects_invalid_verification_limits() {
+        for verification in [
+            "max_concurrent_jobs = 0",
+            "max_concurrent_jobs = 257",
+            "job_timeout_secs = 0",
+            "max_retries = 11",
+            "max_retries = 1\nretry_backoff_millis = 0",
+        ] {
+            let file = config_file(&format!(
+                r#"
+                    [runtime]
+                    control_socket = "/tmp/control.sock"
+                    shutdown_timeout_secs = 10
+
+                    [verification]
+                    {verification}
+                "#,
+            ));
+
+            assert!(matches!(
+                Config::from_file(file.path()),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn loads_disabled_noir_defaults() {
+        let file = config_file(
+            r#"
+                [runtime]
+                control_socket = "/tmp/control.sock"
+                shutdown_timeout_secs = 10
+            "#,
+        );
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert!(!config.noir.enabled);
+        assert_eq!(config.noir.threads_per_job, 1);
+    }
+
+    #[test]
+    fn validates_enabled_noir_paths_and_thread_count() {
+        for noir in [
+            "enabled = true\nbinary_path = \"bb\"\nhome_directory = \"/tmp/bb-home\"",
+            "enabled = true\nbinary_path = \"/tmp/bb\"\nhome_directory = \"bb-home\"",
+            "threads_per_job = 0",
+            "threads_per_job = 257",
+        ] {
+            let file = config_file(&format!(
+                r#"
+                    [runtime]
+                    control_socket = "/tmp/control.sock"
+                    shutdown_timeout_secs = 10
+
+                    [verification.noir]
+                    {noir}
+                "#,
+            ));
+
+            assert!(matches!(
+                Config::from_file(file.path()),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn loads_enabled_loopback_rpc() {
+        let file = config_file(
+            r#"
+                [runtime]
+                control_socket = "/tmp/control.sock"
+                shutdown_timeout_secs = 10
+
+                [rpc]
+                enabled = true
+                listen_address = "[::1]:50051"
+            "#,
+        );
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert!(config.rpc.enabled);
+        assert!(config.rpc.listen_address.ip().is_loopback());
+    }
+
+    #[test]
+    fn rejects_unsafe_or_malformed_rpc_addresses() {
+        for address in [
+            "0.0.0.0:50051",
+            "192.168.1.10:50051",
+            "127.0.0.1:0",
+            "localhost:50051",
+            "127.0.0.1",
+        ] {
+            let file = config_file(&format!(
+                r#"
+                    [runtime]
+                    control_socket = "/tmp/control.sock"
+                    shutdown_timeout_secs = 10
+
+                    [rpc]
+                    enabled = true
+                    listen_address = "{address}"
+                "#,
+            ));
+
+            assert!(matches!(
+                Config::from_file(file.path()),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn loads_enabled_submission_with_required_services() {
+        let file = config_file(
+            r#"
+                [runtime]
+                control_socket = "/tmp/control.sock"
+                shutdown_timeout_secs = 15
+
+                [chain]
+                chain_id = "pulsar-test"
+
+                [listener]
+                enabled = true
+
+                [rpc]
+                enabled = true
+                listen_address = "127.0.0.1:50051"
+
+                [submission]
+                enabled = true
+                listen_address = "127.0.0.1:50052"
+                max_transaction_bytes = 2048
+                max_concurrent_requests = 4
+            "#,
+        );
+
+        let config = Config::from_file(file.path()).unwrap();
+
+        assert!(config.submission.enabled);
+        assert_eq!(config.submission.max_transaction_bytes, 2048);
+        assert_eq!(config.submission.max_concurrent_requests, 4);
+    }
+
+    #[test]
+    fn rejects_unsafe_or_incomplete_submission_config() {
+        for extra in [
+            "",
+            "[chain]\nchain_id = \"pulsar-test\"",
+            "[chain]\nchain_id = \"pulsar-test\"\n[listener]\nenabled = true",
+        ] {
+            let file = config_file(&format!(
+                r#"
+                    [runtime]
+                    control_socket = "/tmp/control.sock"
+                    shutdown_timeout_secs = 15
+
+                    {extra}
+
+                    [submission]
+                    enabled = true
+                "#
+            ));
+            assert!(matches!(
+                Config::from_file(file.path()),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+
+        for address in ["0.0.0.0:50052", "10.0.0.1:50052", "127.0.0.1:0"] {
+            let file = config_file(&format!(
+                r#"
+                    [runtime]
+                    control_socket = "/tmp/control.sock"
+                    shutdown_timeout_secs = 15
+
+                    [chain]
+                    chain_id = "pulsar-test"
+
+                    [listener]
+                    enabled = true
+
+                    [rpc]
+                    enabled = true
+
+                    [submission]
+                    enabled = true
+                    listen_address = "{address}"
+                "#
+            ));
+            assert!(matches!(
+                Config::from_file(file.path()),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+
+        for settings in [
+            "listen_address = \"127.0.0.1:50051\"",
+            "max_transaction_bytes = 0",
+            "max_transaction_bytes = 16777217",
+            "max_concurrent_requests = 0",
+            "max_concurrent_requests = 65",
+        ] {
+            let file = config_file(&format!(
+                r#"
+                    [runtime]
+                    control_socket = "/tmp/control.sock"
+                    shutdown_timeout_secs = 15
+
+                    [chain]
+                    chain_id = "pulsar-test"
+
+                    [listener]
+                    enabled = true
+
+                    [rpc]
+                    enabled = true
+                    listen_address = "127.0.0.1:50051"
+
+                    [submission]
+                    enabled = true
+                    {settings}
+                "#
+            ));
+            assert!(matches!(
+                Config::from_file(file.path()),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn submission_requires_shutdown_margin_for_chain_relay() {
+        let file = config_file(
+            r#"
+                [runtime]
+                control_socket = "/tmp/control.sock"
+                shutdown_timeout_secs = 5
+
+                [chain]
+                chain_id = "pulsar-test"
+                request_timeout_secs = 5
+
+                [listener]
+                enabled = true
+
+                [rpc]
+                enabled = true
+
+                [submission]
+                enabled = true
+            "#,
+        );
+
+        assert!(matches!(
+            Config::from_file(file.path()),
+            Err(Error::InvalidConfig(message))
+                if message.contains("chain.request_timeout_secs")
         ));
     }
 }

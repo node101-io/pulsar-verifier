@@ -1,5 +1,6 @@
 use std::{
     fs,
+    net::{SocketAddr, TcpListener, TcpStream},
     path::{Path, PathBuf},
     process::{Child, Command, Stdio},
     thread,
@@ -56,6 +57,24 @@ fn write_config(temp_dir: &TempDir) -> (PathBuf, PathBuf) {
     (config, socket)
 }
 
+fn write_rpc_config(temp_dir: &TempDir) -> (PathBuf, PathBuf, SocketAddr) {
+    let socket = temp_dir.path().join("runtime/control.sock");
+    let config = temp_dir.path().join("config.toml");
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let rpc_address = listener.local_addr().unwrap();
+    drop(listener);
+    fs::write(
+        &config,
+        format!(
+            "[runtime]\ncontrol_socket = \"{}\"\nshutdown_timeout_secs = 2\n\
+             \n[rpc]\nenabled = true\nlisten_address = \"{rpc_address}\"\n",
+            socket.display()
+        ),
+    )
+    .unwrap();
+    (config, socket, rpc_address)
+}
+
 fn start(config: &Path) -> ChildGuard {
     ChildGuard(
         Command::new(binary())
@@ -73,6 +92,14 @@ fn wait_for_socket(socket: &Path) {
     let deadline = Instant::now() + PROCESS_TIMEOUT;
     while !socket.exists() {
         assert!(Instant::now() < deadline, "control socket was not created");
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn wait_for_rpc(address: SocketAddr) {
+    let deadline = Instant::now() + PROCESS_TIMEOUT;
+    while TcpStream::connect(address).is_err() {
+        assert!(Instant::now() < deadline, "RPC server was not reachable");
         thread::sleep(Duration::from_millis(25));
     }
 }
@@ -110,6 +137,30 @@ fn sigterm_uses_the_same_cleanup_path() {
 
     assert!(child.wait_for_exit().success());
     assert!(!socket.exists());
+}
+
+#[test]
+fn stop_command_gracefully_stops_rpc_enabled_process() {
+    let temp_dir = TempDir::new().unwrap();
+    let (config, socket, rpc_address) = write_rpc_config(&temp_dir);
+    let mut child = start(&config);
+    wait_for_socket(&socket);
+    wait_for_rpc(rpc_address);
+
+    let stop = Command::new(binary())
+        .args(["stop", "--config"])
+        .arg(&config)
+        .output()
+        .unwrap();
+
+    assert!(
+        stop.status.success(),
+        "{}",
+        String::from_utf8_lossy(&stop.stderr)
+    );
+    assert!(child.wait_for_exit().success());
+    assert!(!socket.exists());
+    assert!(TcpStream::connect(rpc_address).is_err());
 }
 
 #[test]

@@ -2,7 +2,7 @@ use std::{sync::Arc, time::Duration};
 
 use moka::Expiry;
 
-use crate::proof::ProofHash;
+use crate::proof::VerificationId;
 
 use super::record::{ProofRecord, VerificationState};
 
@@ -19,17 +19,17 @@ impl TerminalExpiry {
 
     fn duration(&self, record: &ProofRecord) -> Option<Duration> {
         matches!(
-            record.metadata.verification,
-            VerificationState::Verified | VerificationState::Wrong
+            record.metadata.verification.as_ref(),
+            Some(VerificationState::Completed(_))
         )
         .then_some(self.retention)
     }
 }
 
-impl Expiry<ProofHash, Arc<ProofRecord>> for TerminalExpiry {
+impl Expiry<VerificationId, Arc<ProofRecord>> for TerminalExpiry {
     fn expire_after_create(
         &self,
-        _key: &ProofHash,
+        _key: &VerificationId,
         value: &Arc<ProofRecord>,
         _created_at: std::time::Instant,
     ) -> Option<Duration> {
@@ -38,7 +38,7 @@ impl Expiry<ProofHash, Arc<ProofRecord>> for TerminalExpiry {
 
     fn expire_after_read(
         &self,
-        _key: &ProofHash,
+        _key: &VerificationId,
         _value: &Arc<ProofRecord>,
         _read_at: std::time::Instant,
         duration_until_expiry: Option<Duration>,
@@ -49,7 +49,7 @@ impl Expiry<ProofHash, Arc<ProofRecord>> for TerminalExpiry {
 
     fn expire_after_update(
         &self,
-        _key: &ProofHash,
+        _key: &VerificationId,
         value: &Arc<ProofRecord>,
         _updated_at: std::time::Instant,
         _duration_until_expiry: Option<Duration>,

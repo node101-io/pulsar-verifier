@@ -1,0 +1,6 @@
+[package]
+name = "project"
+type = "bin"
+authors = [""]
+
+[dependencies]

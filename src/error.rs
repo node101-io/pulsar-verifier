@@ -1,8 +1,8 @@
-use std::{io, path::PathBuf, time::Duration};
+use std::{io, net::SocketAddr, path::PathBuf, time::Duration};
 
 use thiserror::Error;
 
-use crate::proof::{ProofHash, ProofType};
+use crate::proof::VerificationId;
 
 pub type Result<T, E = Error> = std::result::Result<T, E>;
 
@@ -66,6 +66,38 @@ pub enum Error {
     #[error("P2P authorization error: {0}")]
     P2pAuthorization(String),
 
+    #[error("Pulsar chain client error: {0}")]
+    Chain(String),
+
+    #[error("invalid proof submission: {0}")]
+    InvalidSubmission(String),
+
+    #[error("transaction is {actual_bytes} bytes; maximum is {max_bytes}")]
+    TransactionTooLarge {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
+
+    #[error("transaction {transaction_hash} was rejected by CheckTx ({codespace}:{code}): {log}")]
+    CheckTxRejected {
+        transaction_hash: String,
+        codespace: String,
+        code: u32,
+        log: String,
+    },
+
+    #[error("CometBFT returned an unexpected transaction hash")]
+    TransactionHashMismatch,
+
+    #[error("CometBFT chain ID mismatch: expected {expected}, got {actual}")]
+    ChainIdMismatch { expected: String, actual: String },
+
+    #[error("invalid committed verification contract: {0}")]
+    InvalidChainContract(String),
+
+    #[error("local validator {0} is not in the active validator set")]
+    LocalValidatorRemoved(String),
+
     #[error("P2P protocol error: {0}")]
     P2pProtocol(String),
 
@@ -75,50 +107,59 @@ pub enum Error {
     #[error("P2P driver is draining")]
     P2pDraining,
 
-    #[error("P2P driver must be drained before shutdown")]
-    P2pNotDrained,
-
-    #[error("P2P event loop is closed")]
-    P2pEventLoopClosed,
-
     #[error("P2P driver is closed")]
     P2pDriverClosed,
 
     #[error("{0} task exited unexpectedly")]
     TaskExitedUnexpectedly(&'static str),
 
-    #[error("invalid proof hash: {0}")]
-    InvalidProofHash(String),
+    #[error("invalid verification ID: {0}")]
+    InvalidVerificationId(String),
 
-    #[error("invalid proof type: {0}")]
-    InvalidProofType(String),
+    #[error("unsupported proof type: {0}")]
+    UnsupportedProofType(i32),
 
     #[error("proof store error: {0}")]
     ProofStore(String),
 
-    #[error("proof {proof_hash:?} is {actual_bytes} bytes; maximum is {max_bytes}")]
+    #[error("proof {verification_id} is {actual_bytes} bytes; maximum is {max_bytes}")]
     ProofTooLarge {
-        proof_hash: ProofHash,
+        verification_id: VerificationId,
         actual_bytes: usize,
         max_bytes: usize,
     },
 
-    #[error("proof bytes do not match expected hash {0:?}")]
-    ProofHashMismatch(ProofHash),
+    #[error("proof does not match expected verification ID {0}")]
+    VerificationIdMismatch(VerificationId),
 
-    #[error("proof {proof_hash:?} type conflict: existing {existing}, incoming {incoming}")]
-    ProofTypeConflict {
-        proof_hash: ProofHash,
-        existing: ProofType,
-        incoming: ProofType,
-    },
+    #[error("verification {0} has not been observed on-chain")]
+    ProofNotObserved(VerificationId),
 
-    #[error("proof {0:?} has not been observed on-chain")]
-    ProofNotObserved(ProofHash),
-
-    #[error("invalid verification transition for proof {proof_hash:?}: {reason}")]
+    #[error("invalid verification transition for {verification_id}: {reason}")]
     InvalidVerificationTransition {
-        proof_hash: ProofHash,
+        verification_id: VerificationId,
         reason: String,
     },
+
+    #[error("invalid verification failure: {0}")]
+    InvalidVerificationFailure(String),
+
+    #[error("a verifier is already registered for {0:?}")]
+    DuplicateVerifier(crate::proof::ProofType),
+
+    #[error("failed to initialize Noir verifier: {0}")]
+    NoirInitialization(String),
+
+    #[error("invalid verification service request: {0}")]
+    InvalidVerificationRequest(String),
+
+    #[error("failed to bind RPC server on {address}: {source}")]
+    RpcBind {
+        address: SocketAddr,
+        #[source]
+        source: io::Error,
+    },
+
+    #[error("RPC server failed: {0}")]
+    RpcServer(#[source] tonic::transport::Error),
 }

@@ -1,13 +1,18 @@
 pub mod cli;
 pub mod config;
-pub mod p2p;
 pub mod proof;
 pub mod store;
 
 mod app;
+mod chain;
 mod control;
 mod error;
+mod listener;
+mod p2p;
+mod rpc;
+mod submission;
 mod telemetry;
+mod verification;
 
 use app::App;
 use cli::{Cli, Command};

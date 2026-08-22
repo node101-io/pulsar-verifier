@@ -1,0 +1,138 @@
+syntax = "proto3";
+package pulsarchain.verification.v1;
+
+import "amino/amino.proto";
+import "gogoproto/gogo.proto";
+
+option go_package = "github.com/node101-io/pulsar-chain/x/verification/types";
+
+// ProofType selects the verifier family. The exact statement and circuit are
+// bound separately by the public-input and verification-key hashes.
+enum ProofType {
+  // PROOF_TYPE_UNSPECIFIED is invalid for proof submission.
+  PROOF_TYPE_UNSPECIFIED = 0;
+  // PROOF_TYPE_MINA_PICKLES selects Mina's Pickles proof system.
+  PROOF_TYPE_MINA_PICKLES = 1;
+  // PROOF_TYPE_NOIR_BARRETENBERG selects Noir proofs using Barretenberg.
+  PROOF_TYPE_NOIR_BARRETENBERG = 2;
+}
+
+// ProofKey identifies a proof by absolute block height and in-block index.
+message ProofKey {
+  uint64 submission_height = 1;
+  uint32 index_in_block = 2;
+}
+
+// ProofRecord stores the complete descriptor and its chain-derived identity.
+message ProofRecord {
+  bytes proof_hash = 1;
+  ProofType proof_type = 2;
+  bytes public_inputs_hash = 3;
+  bytes verification_key_hash = 4;
+  bytes verification_id = 5;
+}
+
+// CommitmentRecord stores a validator commitment root.
+message CommitmentRecord {
+  bytes commitment = 1;
+}
+
+// ProofVote records a result for one proof index.
+message ProofVote {
+  uint32 index_in_block = 1;
+  bool result = 2;
+}
+
+// VoteState tracks a validator's effective vote.
+enum VoteState {
+  // VOTE_STATE_NONE means the validator has not voted.
+  VOTE_STATE_NONE = 0;
+  // VOTE_STATE_TRUE is an effective valid vote.
+  VOTE_STATE_TRUE = 1;
+  // VOTE_STATE_FALSE is an effective invalid vote.
+  VOTE_STATE_FALSE = 2;
+  // VOTE_STATE_EQUIVOCATED excludes conflicting votes from the tally.
+  VOTE_STATE_EQUIVOCATED = 3;
+}
+
+// ProofTally stores the historical consensus power behind effective votes.
+message ProofTally {
+  int64 valid_voting_power = 1;
+  int64 invalid_voting_power = 2;
+}
+
+// ProofStatus is the finalized verification outcome.
+enum ProofStatus {
+  // PROOF_STATUS_PENDING is the non-finalized status.
+  PROOF_STATUS_PENDING = 0;
+  // PROOF_STATUS_VALID means valid voting power exceeded two thirds.
+  PROOF_STATUS_VALID = 1;
+  // PROOF_STATUS_INVALID means invalid voting power exceeded two thirds.
+  PROOF_STATUS_INVALID = 2;
+  // PROOF_STATUS_INCONCLUSIVE means neither side reached threshold.
+  PROOF_STATUS_INCONCLUSIVE = 3;
+}
+
+// FinalProofResult stores an immutable finalized proof outcome.
+message FinalProofResult {
+  bytes proof_hash = 1;
+  ProofType proof_type = 2;
+  ProofStatus status = 3;
+  int64 valid_voting_power = 4;
+  int64 invalid_voting_power = 5;
+  int64 total_voting_power = 6;
+  int64 voting_power_threshold = 7;
+  uint64 submission_height = 8;
+  uint64 finalized_height = 9;
+  bytes public_inputs_hash = 10;
+  bytes verification_key_hash = 11;
+  bytes verification_id = 12;
+}
+
+// LeafRevealMode selects a full value or hash-only revelation.
+enum LeafRevealMode {
+  // LEAF_REVEAL_MODE_UNSPECIFIED is invalid.
+  LEAF_REVEAL_MODE_UNSPECIFIED = 0;
+  // LEAF_REVEAL_MODE_HASH_ONLY reveals only the committed leaf hash.
+  LEAF_REVEAL_MODE_HASH_ONLY = 1;
+  // LEAF_REVEAL_MODE_VALUE reveals salt and canonical votes.
+  LEAF_REVEAL_MODE_VALUE = 2;
+}
+
+// RevealedLeaf contains a salt and canonical vote list.
+message RevealedLeaf {
+  bytes salt = 1;
+  repeated ProofVote votes = 2 [(gogoproto.nullable) = false];
+}
+
+// LeafRevelation opens or references one commitment leaf.
+message LeafRevelation {
+  LeafRevealMode mode = 1;
+
+  // payload must match mode.
+  oneof payload {
+    bytes leaf_hash = 2 [(amino.oneof_name) = "pulsarchain/verification/LeafHash"];
+    RevealedLeaf value = 3 [(amino.oneof_name) = "pulsarchain/verification/LeafValue"];
+  }
+}
+
+// CommitmentRevelation opens the left and right commitment leaves.
+message CommitmentRevelation {
+  uint64 commitment_height = 1;
+  LeafRevelation left = 2 [(gogoproto.nullable) = false];
+  LeafRevelation right = 3 [(gogoproto.nullable) = false];
+}
+
+// CommitmentEntry is a query representation of a retained commitment.
+message CommitmentEntry {
+  string validator = 1;
+  uint64 commitment_height = 2;
+  CommitmentRecord commitment = 3 [(gogoproto.nullable) = false];
+}
+
+// VerificationVoteEntry is a query representation of an effective vote.
+message VerificationVoteEntry {
+  ProofKey proof_key = 1 [(gogoproto.nullable) = false];
+  string validator = 2;
+  VoteState state = 3;
+}

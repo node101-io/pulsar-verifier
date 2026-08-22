@@ -1,6 +1,6 @@
 [runtime]
 control_socket = "/tmp/pulsar-verifier-local/control.sock"
-shutdown_timeout_secs = 10
+shutdown_timeout_secs = 15
 
 [proof_store]
 max_capacity_bytes = 536870912
@@ -8,18 +8,51 @@ max_proof_bytes = 8388608
 terminal_retention_secs = 900
 event_buffer = 256
 
+[verification]
+max_concurrent_jobs = 2
+job_timeout_secs = 30
+max_retries = 2
+retry_backoff_millis = 250
+
+[verification.noir]
+enabled = false
+binary_path = ""
+home_directory = ""
+threads_per_job = 1
+
+[rpc]
+enabled = true
+listen_address = "127.0.0.1:50051"
+
+[submission]
+enabled = true
+listen_address = "127.0.0.1:50052"
+max_transaction_bytes = 1048576
+max_concurrent_requests = 16
+
+[chain]
+chain_id = "pulsar-local-1"
+comet_rpc_url = "http://127.0.0.1:26657"
+request_timeout_secs = 5
+
+[listener]
+enabled = true
+reconnect_initial_backoff_millis = 250
+reconnect_max_backoff_secs = 30
+
 [p2p]
 enabled = true
-chain_id = "pulsar-local-1"
 listen_addresses = [
   "/ip4/0.0.0.0/udp/39000/quic-v1",
   "/ip4/0.0.0.0/tcp/39000",
 ]
 bootnodes = []
 validator_key_path = "/home/pulsar/.pulsar/config/priv_validator_key.json"
-comet_rpc_url = "http://127.0.0.1:26657"
-comet_rpc_timeout_secs = 5
 max_availability_message_bytes = 65536
 proof_request_timeout_secs = 10
+max_concurrent_retrievals = 16
+retrieval_timeout_secs = 30
+retrieval_initial_backoff_millis = 250
+retrieval_max_backoff_secs = 2
 command_buffer = 64
 event_buffer = 256

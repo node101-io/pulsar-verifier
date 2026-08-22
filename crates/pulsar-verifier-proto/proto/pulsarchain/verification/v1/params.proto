@@ -1,0 +1,15 @@
+syntax = "proto3";
+package pulsarchain.verification.v1;
+
+import "amino/amino.proto";
+import "gogoproto/gogo.proto";
+
+option go_package = "github.com/node101-io/pulsar-chain/x/verification/types";
+
+// Params defines the governance-controlled verification module parameters.
+message Params {
+  option (amino.name) = "pulsarchain/x/verification/Params";
+  option (gogoproto.equal) = true;
+
+  uint32 max_proofs_per_block = 1;
+}

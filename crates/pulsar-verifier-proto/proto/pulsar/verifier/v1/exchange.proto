@@ -2,26 +2,22 @@ syntax = "proto3";
 
 package pulsar.verifier.v1;
 
-// Requests opaque proof content by its canonical BLAKE3 hash.
+import "pulsar/verifier/v1/proof.proto";
+
+// Requests complete proof content by its canonical verification ID.
 message GetProofRequest {
   string chain_id = 1;
-  bytes proof_hash = 2;
+  bytes verification_id = 2;
 }
 
-// Returns either the opaque proof content or an explicit cache miss.
+// Returns either the complete proof package or an explicit cache miss.
 message GetProofResponse {
   string chain_id = 1;
 
   oneof result {
-    ProofContent content = 2;
+    Proof proof = 2;
     ProofNotFound not_found = 3;
   }
-}
-
-// Keeps proof-system metadata out until a trustworthy type binding exists.
-message ProofContent {
-  bytes proof_hash = 1;
-  bytes proof = 2;
 }
 
 message ProofNotFound {}

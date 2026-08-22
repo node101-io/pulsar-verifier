@@ -1,0 +1,13 @@
+syntax = "proto3";
+
+package pulsar.verifier.v1;
+
+import "pulsarchain/verification/v1/types.proto";
+
+// Carries every artifact required to verify one proof independently.
+message Proof {
+  pulsarchain.verification.v1.ProofType proof_type = 1;
+  bytes proof = 2;
+  bytes public_inputs = 3;
+  bytes verification_key = 4;
+}

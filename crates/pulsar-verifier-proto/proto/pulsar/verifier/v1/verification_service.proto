@@ -1,0 +1,95 @@
+syntax = "proto3";
+
+package pulsar.verifier.v1;
+
+option go_package = "github.com/node101-io/pulsar-chain/x/verification/sidecar/api/v1;sidecarv1";
+
+// VerificationService exposes terminal verification results to the validator
+// and local lifecycle diagnostics to operators.
+service VerificationService {
+  // GetVerificationResults returns the completed subset of requested jobs.
+  rpc GetVerificationResults(GetVerificationResultsRequest) returns (GetVerificationResultsResponse);
+
+  // GetProofStatuses returns local sidecar state for every requested job.
+  rpc GetProofStatuses(GetProofStatusesRequest) returns (GetProofStatusesResponse);
+}
+
+// VerificationVerdict is a completed cryptographic proof verdict.
+enum VerificationVerdict {
+  // VERIFICATION_VERDICT_UNSPECIFIED is never a completed verdict.
+  VERIFICATION_VERDICT_UNSPECIFIED = 0;
+  // VERIFICATION_VERDICT_VALID means the proof verified successfully.
+  VERIFICATION_VERDICT_VALID = 1;
+  // VERIFICATION_VERDICT_INVALID means the proof was definitively rejected.
+  VERIFICATION_VERDICT_INVALID = 2;
+}
+
+// VerificationPhase is the sidecar-local verification lifecycle.
+enum VerificationPhase {
+  // VERIFICATION_PHASE_UNSPECIFIED is invalid.
+  VERIFICATION_PHASE_UNSPECIFIED = 0;
+  // VERIFICATION_PHASE_UNAVAILABLE means proof content is not locally available.
+  VERIFICATION_PHASE_UNAVAILABLE = 1;
+  // VERIFICATION_PHASE_QUEUED means verification has not started.
+  VERIFICATION_PHASE_QUEUED = 2;
+  // VERIFICATION_PHASE_VERIFYING means verification is in progress.
+  VERIFICATION_PHASE_VERIFYING = 3;
+  // VERIFICATION_PHASE_COMPLETED means a terminal verdict is available.
+  VERIFICATION_PHASE_COMPLETED = 4;
+  // VERIFICATION_PHASE_FAILED means no verdict was produced due to an operational failure.
+  VERIFICATION_PHASE_FAILED = 5;
+}
+
+// GetVerificationResultsRequest selects verification requests for the consensus hot path.
+message GetVerificationResultsRequest {
+  // verification_ids contains at most 512 unique 32-byte request IDs.
+  repeated bytes verification_ids = 1;
+}
+
+// VerificationResult is one completed verification-request verdict.
+message VerificationResult {
+  // verification_id is one ID from the corresponding request.
+  bytes verification_id = 1;
+  // verdict is VALID or INVALID; UNSPECIFIED is not a result.
+  VerificationVerdict verdict = 2;
+}
+
+// GetVerificationResultsResponse contains the unordered completed subset of
+// requested IDs. Missing IDs do not yet have a terminal verdict.
+message GetVerificationResultsResponse {
+  repeated VerificationResult results = 1;
+}
+
+// VerificationFailure describes a sidecar-local operational failure, never an
+// invalid proof verdict.
+message VerificationFailure {
+  // code is a stable machine-readable identifier of at most 64 bytes.
+  string code = 1;
+  // message is a human-readable diagnostic of at most 256 bytes.
+  string message = 2;
+  // retryable indicates whether the sidecar may later produce a verdict.
+  bool retryable = 3;
+}
+
+// ProofVerificationStatus describes local sidecar state for one request.
+message ProofVerificationStatus {
+  bytes verification_id = 1;
+  // phase is sidecar-local and must not be treated as consensus state.
+  VerificationPhase phase = 2;
+  // verdict is set only when phase is COMPLETED.
+  VerificationVerdict verdict = 3;
+  // failure is set only when phase is FAILED.
+  VerificationFailure failure = 4;
+}
+
+// GetProofStatusesRequest selects verification requests for local diagnostics.
+message GetProofStatusesRequest {
+  // verification_ids contains at most 512 unique 32-byte request IDs.
+  repeated bytes verification_ids = 1;
+}
+
+// GetProofStatusesResponse contains one unordered local status per requested
+// ID. Unknown IDs are represented with the UNAVAILABLE phase.
+message GetProofStatusesResponse {
+  repeated ProofVerificationStatus statuses = 1;
+}
