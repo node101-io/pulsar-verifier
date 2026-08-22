@@ -19,6 +19,8 @@ const ED25519_PRIVATE_TYPES: &[&str] = &["tendermint/PrivKeyEd25519", "cometbft/
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ValidatorKeyFile {
+    #[serde(rename = "address")]
+    _address: String,
     pub_key: EncodedKey,
     priv_key: EncodedKey,
 }
@@ -127,6 +129,7 @@ mod tests {
         let mut file = NamedTempFile::new().unwrap();
         let bytes = keypair.to_bytes();
         let json = serde_json::json!({
+            "address": "0123456789ABCDEF0123456789ABCDEF01234567",
             "pub_key": {
                 "type": "tendermint/PubKeyEd25519",
                 "value": STANDARD.encode(keypair.public().to_bytes()),
@@ -170,6 +173,7 @@ mod tests {
         let other = identity::ed25519::Keypair::generate();
         let mut file = validator_file(&keypair);
         let json = serde_json::json!({
+            "address": "0123456789ABCDEF0123456789ABCDEF01234567",
             "pub_key": {
                 "type": "tendermint/PubKeyEd25519",
                 "value": STANDARD.encode(other.public().to_bytes()),

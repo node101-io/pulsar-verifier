@@ -30,7 +30,6 @@ Implemented:
 Not yet implemented:
 
 - Mina Pickles verification
-- Full Pulsar multi-validator end-to-end deployment validation
 
 ## CLI
 
@@ -232,3 +231,23 @@ PULSAR_BB_PATH=/absolute/path/to/bb \
 PULSAR_BB_HOME=/absolute/path/to/home \
 cargo test bb_5_2_0_verifies_pinned_noir_artifacts -- --ignored
 ```
+
+## Container Image
+
+The repository Dockerfile builds the sidecar and pins the official
+Barretenberg `5.2.0` amd64 release by SHA-256. During the image build it verifies
+the pinned Noir fixture once, which provisions the required CRS segment into the
+image. The entrypoint copies that seed into writable ephemeral storage because
+Barretenberg locks its CRS directory; runtime startup performs no download.
+
+```bash
+docker buildx build --load --platform linux/amd64 \
+  -t pulsar-verifier:local .
+```
+
+The image expects `/etc/pulsar-verifier/config.toml`. Validator deployments
+mount `priv_validator_key.json` read-only and run the sidecar in the validator
+container's network namespace, preserving the loopback-only chain and gRPC
+trust boundary. The Pulsar chain repository's opt-in verifier testnet profile
+exercises three validators, P2P proof retrieval, real Noir verification, and
+the final chain result.

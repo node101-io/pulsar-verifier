@@ -657,12 +657,9 @@ exit 1"#,
             verification_key: Bytes::new(),
             ..invalid_inputs
         };
-        assert!(
-            verifier
-                .verify(&wrong_key, CancellationToken::new())
-                .await
-                .is_err(),
-            "malformed verification keys are operational failures, not invalid verdicts"
+        assert_eq!(
+            verifier.verify(&wrong_key, CancellationToken::new()).await,
+            Ok(VerificationVerdict::Invalid)
         );
     }
 }
