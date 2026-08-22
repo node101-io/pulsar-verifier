@@ -20,6 +20,7 @@ pub struct Config {
     pub proof_store: ProofStoreConfig,
     pub p2p: P2pConfig,
     pub verification: VerificationConfig,
+    pub noir: NoirConfig,
     pub rpc: RpcConfig,
     pub submission: SubmissionConfig,
 }
@@ -85,6 +86,27 @@ pub struct VerificationConfig {
     pub job_timeout: Duration,
     pub max_retries: u32,
     pub retry_backoff: Duration,
+}
+
+/// Validated process settings for the optional Noir/Barretenberg backend.
+#[derive(Debug, Clone)]
+pub struct NoirConfig {
+    pub enabled: bool,
+    pub binary_path: PathBuf,
+    pub home_directory: PathBuf,
+    pub threads_per_job: usize,
+}
+
+impl NoirConfig {
+    #[cfg(test)]
+    pub(crate) fn disabled() -> Self {
+        Self {
+            enabled: false,
+            binary_path: PathBuf::new(),
+            home_directory: PathBuf::new(),
+            threads_per_job: 1,
+        }
+    }
 }
 
 /// Process lifecycle settings shared by the `run` and `stop` commands.
@@ -230,13 +252,14 @@ impl Default for FileSubmissionConfig {
     }
 }
 
-#[derive(Debug, Deserialize, Clone, Copy)]
+#[derive(Debug, Deserialize, Clone)]
 #[serde(default, deny_unknown_fields)]
 struct FileVerificationConfig {
     max_concurrent_jobs: usize,
     job_timeout_secs: u64,
     max_retries: u32,
     retry_backoff_millis: u64,
+    noir: FileNoirConfig,
 }
 
 impl Default for FileVerificationConfig {
@@ -246,6 +269,27 @@ impl Default for FileVerificationConfig {
             job_timeout_secs: 30,
             max_retries: 2,
             retry_backoff_millis: 250,
+            noir: FileNoirConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Clone)]
+#[serde(default, deny_unknown_fields)]
+struct FileNoirConfig {
+    enabled: bool,
+    binary_path: PathBuf,
+    home_directory: PathBuf,
+    threads_per_job: usize,
+}
+
+impl Default for FileNoirConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            binary_path: PathBuf::new(),
+            home_directory: PathBuf::new(),
+            threads_per_job: 1,
         }
     }
 }
@@ -358,7 +402,7 @@ impl Config {
             proof_store.max_proof_bytes,
             chain.chain_id.clone(),
         )?;
-        let verification = validate_verification(file.verification)?;
+        let (verification, noir) = validate_verification(file.verification)?;
         let rpc = validate_rpc(&file.rpc)?;
         if p2p.enabled && runtime.shutdown_timeout <= p2p.proof_request_timeout {
             return Err(Error::InvalidConfig(
@@ -400,6 +444,7 @@ impl Config {
             proof_store,
             p2p,
             verification,
+            noir,
             rpc,
             submission,
         })
@@ -503,7 +548,7 @@ fn validate_loopback_address(section: &str, enabled: bool, value: &str) -> Resul
     Ok(address)
 }
 
-fn validate_verification(file: FileVerificationConfig) -> Result<VerificationConfig> {
+fn validate_verification(file: FileVerificationConfig) -> Result<(VerificationConfig, NoirConfig)> {
     if !(1..=256).contains(&file.max_concurrent_jobs) {
         return Err(Error::InvalidConfig(
             "verification.max_concurrent_jobs must be between 1 and 256".to_owned(),
@@ -526,12 +571,34 @@ fn validate_verification(file: FileVerificationConfig) -> Result<VerificationCon
         ));
     }
 
-    Ok(VerificationConfig {
-        max_concurrent_jobs: file.max_concurrent_jobs,
-        job_timeout: Duration::from_secs(file.job_timeout_secs),
-        max_retries: file.max_retries,
-        retry_backoff: Duration::from_millis(file.retry_backoff_millis),
-    })
+    if !(1..=256).contains(&file.noir.threads_per_job) {
+        return Err(Error::InvalidConfig(
+            "verification.noir.threads_per_job must be between 1 and 256".to_owned(),
+        ));
+    }
+    if file.noir.enabled
+        && (!file.noir.binary_path.is_absolute() || !file.noir.home_directory.is_absolute())
+    {
+        return Err(Error::InvalidConfig(
+            "verification.noir binary_path and home_directory must be absolute when enabled"
+                .to_owned(),
+        ));
+    }
+
+    Ok((
+        VerificationConfig {
+            max_concurrent_jobs: file.max_concurrent_jobs,
+            job_timeout: Duration::from_secs(file.job_timeout_secs),
+            max_retries: file.max_retries,
+            retry_backoff: Duration::from_millis(file.retry_backoff_millis),
+        },
+        NoirConfig {
+            enabled: file.noir.enabled,
+            binary_path: file.noir.binary_path,
+            home_directory: file.noir.home_directory,
+            threads_per_job: file.noir.threads_per_job,
+        },
+    ))
 }
 
 fn validate_proof_store(file: FileProofStoreConfig) -> Result<ProofStoreConfig> {
@@ -986,6 +1053,47 @@ mod tests {
 
                     [verification]
                     {verification}
+                "#,
+            ));
+
+            assert!(matches!(
+                Config::from_file(file.path()),
+                Err(Error::InvalidConfig(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn loads_disabled_noir_defaults() {
+        let file = config_file(
+            r#"
+                [runtime]
+                control_socket = "/tmp/control.sock"
+                shutdown_timeout_secs = 10
+            "#,
+        );
+
+        let config = Config::from_file(file.path()).unwrap();
+        assert!(!config.noir.enabled);
+        assert_eq!(config.noir.threads_per_job, 1);
+    }
+
+    #[test]
+    fn validates_enabled_noir_paths_and_thread_count() {
+        for noir in [
+            "enabled = true\nbinary_path = \"bb\"\nhome_directory = \"/tmp/bb-home\"",
+            "enabled = true\nbinary_path = \"/tmp/bb\"\nhome_directory = \"bb-home\"",
+            "threads_per_job = 0",
+            "threads_per_job = 257",
+        ] {
+            let file = config_file(&format!(
+                r#"
+                    [runtime]
+                    control_socket = "/tmp/control.sock"
+                    shutdown_timeout_secs = 10
+
+                    [verification.noir]
+                    {noir}
                 "#,
             ));
 

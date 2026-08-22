@@ -24,11 +24,13 @@ Implemented:
 - Loopback consumer submission RPC with proof-to-transaction binding validation
 - Store-first signed Cosmos transaction relay through local CometBFT `CheckTx`
 - Automatic bounded proof retrieval after committed chain observation
+- Optional production Noir verifier using Barretenberg 5.2.0
 - A pinned Noir/Barretenberg 5.2.0 compatibility fixture
 
 Not yet implemented:
 
-- The production Noir backend
+- Mina Pickles verification
+- Full Pulsar multi-validator end-to-end deployment validation
 
 ## CLI
 
@@ -127,7 +129,7 @@ verification_id = SHA256(
 ```
 
 The chain recognizes Mina Pickles and Noir Barretenberg proof types. The MVP
-sidecar will initially implement only Noir verification. A Mina request can
+sidecar implements only Noir verification. A Mina request can
 therefore remain without a completed local verdict; it must never be reported as
 cryptographically invalid merely because the backend is unavailable.
 
@@ -159,9 +161,8 @@ remain available for explicit retry policy.
 The verification worker subscribes before taking a ready-record snapshot, claims
 each ID through the Store's single-flight transition, and runs at most two jobs by
 default. Timeout and backend failures remain operational `FAILED` states and never
-become cryptographic `INVALID` verdicts. The current production registry is empty;
-the deterministic fake verifier exists only in tests until the Noir backend is
-implemented.
+become cryptographic `INVALID` verdicts. The deterministic fake verifier exists
+only in tests; production registers Noir only when `[verification.noir]` is enabled.
 
 The development defaults bound the cache to 512 MiB and each encoded composite
 proof to 8 MiB. Capacity eviction may remove non-terminal records to preserve the
@@ -195,6 +196,28 @@ waiting-content snapshot after restart or subscriber lag.
 
 ## Noir Compatibility
 
+The Noir backend starts one isolated `bb msgpack run` process per verification
+attempt. The global `verification.max_concurrent_jobs` limit therefore also bounds
+the number of simultaneous Barretenberg processes. Each retry starts a fresh
+process; timeout cancellation kills and reaps the active child before the worker
+continues.
+
+Noir is disabled in packaged configs. Enabling it requires an exact Barretenberg
+5.2.0 executable and a pre-provisioned CRS directory:
+
+```toml
+[verification.noir]
+enabled = true
+binary_path = "/absolute/path/to/bb"
+home_directory = "/absolute/path/to/bb-home"
+threads_per_job = 1
+```
+
+Startup fails closed unless `binary_path` is executable, `bb --version` returns
+exactly `5.2.0`, and `<home_directory>/.bb-crs` exists. The verifier never downloads
+CRS data at runtime. Proof and public-input artifacts use exact 32-byte field
+framing; the verification key remains raw bytes.
+
 `tests/fixtures/noir/bb-5.2.0` pins the MVP artifact format:
 
 - Nargo `1.0.0-beta.25`
@@ -207,7 +230,5 @@ external `bb` binary and pre-provisioned CRS:
 ```bash
 PULSAR_BB_PATH=/absolute/path/to/bb \
 PULSAR_BB_HOME=/absolute/path/to/home \
-cargo test --test noir_compatibility -- --ignored
+cargo test bb_5_2_0_verifies_pinned_noir_artifacts -- --ignored
 ```
-
-The production verifier worker/backend remains a later milestone.

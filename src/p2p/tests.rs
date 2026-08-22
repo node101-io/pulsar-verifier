@@ -26,6 +26,7 @@ impl Verifier for ValidVerifier {
     async fn verify(
         &self,
         _proof: &Proof,
+        _cancel: CancellationToken,
     ) -> std::result::Result<VerificationVerdict, VerificationFailure> {
         Ok(VerificationVerdict::Valid)
     }

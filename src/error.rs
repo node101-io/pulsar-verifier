@@ -147,6 +147,9 @@ pub enum Error {
     #[error("a verifier is already registered for {0:?}")]
     DuplicateVerifier(crate::proof::ProofType),
 
+    #[error("failed to initialize Noir verifier: {0}")]
+    NoirInitialization(String),
+
     #[error("invalid verification service request: {0}")]
     InvalidVerificationRequest(String),
 

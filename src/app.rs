@@ -10,9 +10,10 @@ use crate::{
     control::ControlServer,
     listener::{ListenerExit, PulsarListener},
     p2p::{P2pExit, P2pService, ValidatorSetUpdater},
+    proof::ProofType,
     rpc::{RpcExit, RpcServer, SubmissionRpcExit, SubmissionRpcServer},
     store::ProofStore,
-    verification::{VerificationWorker, VerifierRegistry},
+    verification::{NoirVerifier, VerificationWorker, Verifier, VerifierRegistry},
 };
 
 const VERIFICATION_TASK: &str = "verification worker";
@@ -34,18 +35,21 @@ impl App {
     pub(crate) async fn run(config: Config) -> Result<()> {
         let control = ControlServer::bind(&config.runtime.control_socket).await?;
         let proof_store = Arc::new(ProofStore::new(config.proof_store)?);
+        let registry = if config.noir.enabled {
+            let verifier =
+                Arc::new(NoirVerifier::initialize(&config.noir).await?) as Arc<dyn Verifier>;
+            VerifierRegistry::new([(ProofType::NoirBarretenberg, verifier)])?
+        } else {
+            VerifierRegistry::default()
+        };
         let submission_chain = config
             .submission
             .enabled
             .then(|| PulsarClient::new(&config.chain))
             .transpose()?;
         // Subscribe before network producers can publish Store transitions.
-        // TODO: Register the production Noir backend after its runtime is implemented.
-        let verification_worker = VerificationWorker::new(
-            Arc::clone(&proof_store),
-            VerifierRegistry::new([])?,
-            config.verification,
-        );
+        let verification_worker =
+            VerificationWorker::new(Arc::clone(&proof_store), registry, config.verification);
         let mut p2p = if config.p2p.enabled {
             Some(P2pService::start(&config.p2p, &config.chain, Arc::clone(&proof_store)).await?)
         } else {
@@ -546,15 +550,15 @@ async fn wait_for_signal() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use std::time::Duration;
+    use std::{fs, os::unix::fs::PermissionsExt as _, time::Duration};
 
     use tempfile::TempDir;
 
     use super::*;
     use crate::{
         config::{
-            ChainConfig, ListenerConfig, P2pConfig, ProofStoreConfig, RpcConfig, RuntimeConfig,
-            VerificationConfig,
+            ChainConfig, ListenerConfig, NoirConfig, P2pConfig, ProofStoreConfig, RpcConfig,
+            RuntimeConfig, VerificationConfig,
         },
         control::request_shutdown,
         store::ProofStore,
@@ -584,6 +588,7 @@ mod tests {
                 max_retries: 0,
                 retry_backoff: Duration::ZERO,
             },
+            noir: NoirConfig::disabled(),
             rpc: RpcConfig::disabled(),
             submission: crate::config::SubmissionConfig::disabled(),
         }
@@ -606,6 +611,40 @@ mod tests {
         request_shutdown(&client_config).await.unwrap();
         app.await.unwrap().unwrap();
         assert!(!client_config.control_socket.exists());
+    }
+
+    #[tokio::test]
+    async fn app_starts_with_enabled_noir_backend() {
+        let temp_dir = TempDir::new().unwrap();
+        let binary = temp_dir.path().join("bb");
+        fs::write(
+            &binary,
+            "#!/bin/sh\nif [ \"$1\" = \"--version\" ]; then printf '5.2.0\\n'; fi\n",
+        )
+        .unwrap();
+        let mut permissions = fs::metadata(&binary).unwrap().permissions();
+        permissions.set_mode(0o700);
+        fs::set_permissions(&binary, permissions).unwrap();
+        fs::create_dir(temp_dir.path().join(".bb-crs")).unwrap();
+
+        let mut config = test_config(&temp_dir);
+        config.noir = NoirConfig {
+            enabled: true,
+            binary_path: binary,
+            home_directory: temp_dir.path().to_path_buf(),
+            threads_per_job: 1,
+        };
+        let client_config = config.runtime.clone();
+        let app = tokio::spawn(App::run(config));
+        for _ in 0..40 {
+            if client_config.control_socket.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+
+        request_shutdown(&client_config).await.unwrap();
+        app.await.unwrap().unwrap();
     }
 
     #[tokio::test]

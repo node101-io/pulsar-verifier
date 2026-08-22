@@ -21,6 +21,8 @@ use crate::{
 
 use super::VerifierRegistry;
 
+const ATTEMPT_CLEANUP_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Subscribes to ready Store records and runs a bounded set of verifier jobs.
 pub(crate) struct VerificationWorker {
     store: Arc<ProofStore>,
@@ -199,23 +201,7 @@ async fn execute_job(
 
     for attempt in 0..=config.max_retries {
         let started = Instant::now();
-        let result = AssertUnwindSafe(timeout(config.job_timeout, verifier.verify(&job.proof)))
-            .catch_unwind()
-            .await;
-        let outcome = match result {
-            Ok(Ok(Ok(verdict))) => VerificationOutcome::Completed(verdict),
-            Ok(Ok(Err(error))) => VerificationOutcome::Failed(error),
-            Ok(Err(_)) => VerificationOutcome::Failed(failure(
-                "verification_timeout",
-                "verification attempt timed out",
-                true,
-            )),
-            Err(_) => VerificationOutcome::Failed(failure(
-                "verifier_panicked",
-                "verifier backend panicked",
-                false,
-            )),
-        };
+        let outcome = execute_attempt(verifier.as_ref(), &job.proof, config.job_timeout).await;
 
         tracing::debug!(
             %verification_id,
@@ -235,6 +221,34 @@ async fn execute_job(
     }
 
     unreachable!("bounded verification loop always returns")
+}
+
+async fn execute_attempt(
+    verifier: &dyn super::Verifier,
+    proof: &crate::proof::Proof,
+    attempt_timeout: std::time::Duration,
+) -> VerificationOutcome {
+    let cancel = CancellationToken::new();
+    let verification = AssertUnwindSafe(verifier.verify(proof, cancel.clone())).catch_unwind();
+    tokio::pin!(verification);
+    match timeout(attempt_timeout, &mut verification).await {
+        Ok(Ok(Ok(verdict))) => VerificationOutcome::Completed(verdict),
+        Ok(Ok(Err(error))) => VerificationOutcome::Failed(error),
+        Ok(Err(_)) => VerificationOutcome::Failed(failure(
+            "verifier_panicked",
+            "verifier backend panicked",
+            false,
+        )),
+        Err(_) => {
+            cancel.cancel();
+            let _ = timeout(ATTEMPT_CLEANUP_TIMEOUT, &mut verification).await;
+            VerificationOutcome::Failed(failure(
+                "verification_timeout",
+                "verification attempt timed out",
+                true,
+            ))
+        }
+    }
 }
 
 fn failure(code: &'static str, message: &'static str, retryable: bool) -> VerificationFailure {
@@ -323,6 +337,7 @@ mod tests {
         async fn verify(
             &self,
             _proof: &Proof,
+            _cancel: CancellationToken,
         ) -> std::result::Result<VerificationVerdict, VerificationFailure> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             let active = self.active.fetch_add(1, Ordering::SeqCst) + 1;
@@ -390,6 +405,7 @@ mod tests {
         async fn verify(
             &self,
             _proof: &Proof,
+            _cancel: CancellationToken,
         ) -> std::result::Result<VerificationVerdict, VerificationFailure> {
             Ok(VerificationVerdict::Invalid)
         }
@@ -453,6 +469,7 @@ mod tests {
         async fn verify(
             &self,
             _proof: &Proof,
+            _cancel: CancellationToken,
         ) -> std::result::Result<VerificationVerdict, VerificationFailure> {
             if self.calls.fetch_add(1, Ordering::SeqCst) < 2 {
                 Err(failure("backend_busy", "backend is busy", true))
@@ -493,6 +510,7 @@ mod tests {
         async fn verify(
             &self,
             _proof: &Proof,
+            _cancel: CancellationToken,
         ) -> std::result::Result<VerificationVerdict, VerificationFailure> {
             self.calls.fetch_add(1, Ordering::SeqCst);
             Err(failure("backend_busy", "backend is busy", true))
@@ -523,6 +541,7 @@ mod tests {
 
     struct PendingVerifier {
         calls: AtomicUsize,
+        cancellations: AtomicUsize,
     }
 
     #[async_trait]
@@ -530,9 +549,12 @@ mod tests {
         async fn verify(
             &self,
             _proof: &Proof,
+            cancel: CancellationToken,
         ) -> std::result::Result<VerificationVerdict, VerificationFailure> {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            std::future::pending().await
+            cancel.cancelled().await;
+            self.cancellations.fetch_add(1, Ordering::SeqCst);
+            Err(failure("backend_cancelled", "backend cancelled", true))
         }
     }
 
@@ -540,6 +562,7 @@ mod tests {
     async fn retries_timeouts_and_reports_a_bounded_failure() {
         let verifier = Arc::new(PendingVerifier {
             calls: AtomicUsize::new(0),
+            cancellations: AtomicUsize::new(0),
         });
         let proof = proof(9);
         let completion = execute_job(
@@ -555,6 +578,7 @@ mod tests {
         .await;
 
         assert_eq!(verifier.calls.load(Ordering::SeqCst), 3);
+        assert_eq!(verifier.cancellations.load(Ordering::SeqCst), 3);
         let VerificationOutcome::Failed(failure) = completion.outcome else {
             panic!("timeout must be an operational failure")
         };
@@ -569,6 +593,7 @@ mod tests {
         async fn verify(
             &self,
             _proof: &Proof,
+            _cancel: CancellationToken,
         ) -> std::result::Result<VerificationVerdict, VerificationFailure> {
             panic!("test verifier panic")
         }

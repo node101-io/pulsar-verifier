@@ -1,8 +1,10 @@
+mod noir;
 mod worker;
 
 use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     Error, Result,
@@ -10,6 +12,7 @@ use crate::{
     store::{VerificationFailure, VerificationVerdict},
 };
 
+pub(crate) use noir::NoirVerifier;
 pub(crate) use worker::VerificationWorker;
 
 /// Proof-system backend contract. Each backend owns its execution strategy.
@@ -18,6 +21,7 @@ pub(crate) trait Verifier: Send + Sync {
     async fn verify(
         &self,
         proof: &Proof,
+        cancel: CancellationToken,
     ) -> std::result::Result<VerificationVerdict, VerificationFailure>;
 }
 
@@ -58,6 +62,7 @@ mod tests {
         async fn verify(
             &self,
             _proof: &Proof,
+            _cancel: CancellationToken,
         ) -> std::result::Result<VerificationVerdict, VerificationFailure> {
             Ok(VerificationVerdict::Valid)
         }
@@ -90,7 +95,11 @@ mod tests {
         };
 
         assert_eq!(
-            registry.get(proof.proof_type).unwrap().verify(&proof).await,
+            registry
+                .get(proof.proof_type)
+                .unwrap()
+                .verify(&proof, CancellationToken::new())
+                .await,
             Ok(VerificationVerdict::Valid)
         );
         assert!(registry.get(ProofType::MinaPickles).is_none());

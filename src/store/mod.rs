@@ -20,6 +20,7 @@ use crate::{
 
 pub use event::{ProofEvictionCause, ProofSource, ProofStoreEvent, ProofStoreSubscription};
 use expiry::TerminalExpiry;
+pub(crate) use record::FAILURE_MESSAGE_MAX_BYTES;
 pub use record::{
     CompletedVerification, ProofMetadata, ProofRecord, StoreChange, StoredProof,
     StoredVerificationStatus, VerificationFailure, VerificationJob, VerificationOutcome,
