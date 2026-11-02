@@ -1095,7 +1095,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a8f2f12607f92c69b12ed746fabf9ca4f5c482cba46679c1a75b874ed7c26adb"
 dependencies = [
  "futures-io",
- "rustls 0.23.41",
+ "rustls 0.23.43",
  "rustls-pki-types",
 ]
 
@@ -2041,7 +2041,7 @@ dependencies = [
  "quinn-proto",
  "rand 0.8.7",
  "ring",
- "rustls 0.23.41",
+ "rustls 0.23.43",
  "socket2 0.5.10",
  "thiserror 2.0.18",
  "tokio",
@@ -2126,7 +2126,7 @@ dependencies = [
  "libp2p-identity",
  "rcgen",
  "ring",
- "rustls 0.23.41",
+ "rustls 0.23.43",
  "rustls-webpki 0.103.13",
  "thiserror 2.0.18",
  "x509-parser",
@@ -2945,7 +2945,7 @@ dependencies = [
  "quinn-proto",
  "quinn-udp",
  "rustc-hash",
- "rustls 0.23.41",
+ "rustls 0.23.43",
  "socket2 0.6.4",
  "thiserror 2.0.18",
  "tokio",
@@ -2967,7 +2967,7 @@ dependencies = [
  "rand_pcg",
  "ring",
  "rustc-hash",
- "rustls 0.23.41",
+ "rustls 0.23.43",
  "rustls-pki-types",
  "slab",
  "thiserror 2.0.18",
@@ -3319,9 +3319,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.41"
+version = "0.23.43"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6b92b125634d9b795e7beca796cc790df15a7fb38323bf3196fda83292d06b1f"
+checksum = "0283386ce02abc0151e1761d08802dfe86c173b0b494af5cbc086574e453da06"
 dependencies = [
  "once_cell",
  "ring",
